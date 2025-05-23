@@ -15,11 +15,6 @@ pub struct Tts<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> Tts<R> {
     pub fn speak(&self, text: String, language: Option<String>) -> crate::Result<()> {
-        // You can print or ignore language for desktop
-        println!(
-            "Desktop TTS speak: text = {}, language = {:?}",
-            text, language
-        );
         Ok(())
     }
 

@@ -15,7 +15,7 @@ import java.util.Locale
 import java.util.UUID
 
 @InvokeArg
-class SpeakArgs {
+internal class SpeakArgs {
     lateinit var text: String
     var language: String? = null
 }

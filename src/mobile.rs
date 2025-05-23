@@ -21,7 +21,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 ) -> crate::Result<Tts<R>> {
     #[cfg(target_os = "android")]
     let handle =
-        api.register_android_plugin("space.httpjamesm.tauri_plugin_tts", "ExamplePlugin")?;
+        api.register_android_plugin("space.httpjames.tauri_plugin_tts", "ExamplePlugin")?;
     #[cfg(target_os = "ios")]
     let handle = api.register_ios_plugin(init_plugin_tts)?;
     Ok(Tts(handle))

@@ -3,6 +3,7 @@ package space.httpjames.tauri_plugin_tts
 import android.app.Activity
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.util.Log
 import android.webkit.WebView
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -53,17 +54,21 @@ class ExamplePlugin(private val activity: Activity): Plugin(activity) {
 
         try {
             val args = invoke.parseArgs(SpeakArgs::class.java)
-            
+
             // Set language if provided
             args.language?.let { lang ->
                 try {
-                    val locale = Locale(lang)
+                    val locale = Locale.forLanguageTag(lang)
+                    Log.d("TTS", "Requested language: $lang → Parsed locale: $locale")
+
                     val result = tts?.setLanguage(locale)
                     if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        Log.e("TTS", "Language not supported or missing data: $lang")
                         invoke.reject("Language not supported: $lang")
                         return
                     }
                 } catch (e: Exception) {
+                    Log.e("TTS", "Invalid language tag: $lang", e)
                     invoke.reject("Invalid language code: $lang")
                     return
                 }
@@ -91,10 +96,12 @@ class ExamplePlugin(private val activity: Activity): Plugin(activity) {
 
             val result = tts?.speak(args.text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
             if (result == TextToSpeech.ERROR) {
+                Log.e("TTS", "Failed to queue speech for text: ${args.text}")
                 invoke.reject("Failed to queue speech")
             }
 
         } catch (e: Exception) {
+            Log.e("TTS", "Unexpected exception", e)
             invoke.reject(e.message ?: "Unknown error")
         }
     }

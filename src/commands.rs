@@ -4,8 +4,12 @@ use crate::Result;
 use crate::TtsExt;
 
 #[command]
-pub(crate) async fn speak<R: Runtime>(app: AppHandle<R>, text: String) -> Result<()> {
-    app.tts().speak(text)
+pub(crate) async fn speak<R: Runtime>(
+    app: AppHandle<R>,
+    text: String,
+    language: Option<String>,
+) -> Result<()> {
+    app.tts().speak(text, language)
 }
 
 #[command]

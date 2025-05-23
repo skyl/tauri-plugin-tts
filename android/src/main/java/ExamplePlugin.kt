@@ -16,7 +16,7 @@ import java.util.UUID
 
 @InvokeArg
 class SpeakArgs {
-    var text: String = ""
+    lateinit var text: String
     var language: String? = null
 }
 
@@ -53,7 +53,7 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun speak(invoke: Invoke) {
         Log.e("TTS", "🚨 speak() called")
-        Log.e("TTS", "🚨 RAW JSON from invoke: ${invoke.json}")
+        // Log.e("TTS", "🚨 invoke: ${invoke}")
 
         if (!isInitialized || tts == null) {
             Log.e("TTS", "🚨 TTS not initialized")

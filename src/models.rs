@@ -16,4 +16,5 @@ pub struct PingResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SpeakArgs {
     pub text: String,
+    pub language: Option<String>,
 }

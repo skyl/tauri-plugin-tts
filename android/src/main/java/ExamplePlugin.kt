@@ -53,6 +53,7 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun speak(invoke: Invoke) {
         Log.e("TTS", "🚨 speak() called")
+        Log.e("TTS", "🚨 RAW JSON from invoke: ${invoke.json()}")
 
         if (!isInitialized || tts == null) {
             Log.e("TTS", "🚨 TTS not initialized")

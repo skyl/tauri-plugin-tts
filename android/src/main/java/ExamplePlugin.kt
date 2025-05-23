@@ -20,7 +20,7 @@ internal class SpeakArgs {
 }
 
 @TauriPlugin
-class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
+class ExamplePlugin(private val activity: Activity): Plugin(activity) {
     private var tts: TextToSpeech? = null
     private var isInitialized = false
 
@@ -46,7 +46,6 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun speak(invoke: Invoke) {
-
         if (!isInitialized || tts == null) {
             invoke.reject("TTS not initialized")
             return
@@ -58,9 +57,7 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
             args.language?.let { lang ->
                 try {
                     val locale = Locale.forLanguageTag(lang)
-
                     val result = tts?.setLanguage(locale)
-
                     if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
                         invoke.reject("Language not supported: $lang")
                         return
@@ -81,7 +78,11 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
                 }
 
                 override fun onDone(utteranceId: String?) {
-                    invoke.resolve(null) // ensure compatibility with Tauri Rust layer
+                    val ret = JSObject()
+                    ret.put("success", true)
+                    invoke.resolve(ret)
+                    // ??
+                    // invoke.resolve(null) // ensure compatibility with Tauri Rust layer
                 }
 
                 override fun onError(utteranceId: String?) {
@@ -90,7 +91,6 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
             })
 
             val result = tts?.speak(args.text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
-
             if (result == TextToSpeech.ERROR) {
                 invoke.reject("Failed to queue speech")
             }

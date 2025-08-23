@@ -17,13 +17,29 @@ private let ttsLogObj = OSLog(subsystem: TTS_SUBSYSTEM, category: TTS_CATEGORY)
 }
 
 // ----------------------------------------------------------------------------
+// Rate mapping (WEB 0.0..1.5  ->  iOS utter.rate ≈ 0.2..0.8)
+// Adjust these three if “normal” feels a hair too fast/slow.
+// ----------------------------------------------------------------------------
+private let IOS_RATE_MIN: Double = 0.20  // lower bound of utter.rate
+private let IOS_RATE_MAX: Double = 0.80  // upper bound of utter.rate
+private let IOS_RATE_SKEW: Double = -0.03  // small global nudge; negative = slightly slower
+
+private func mapWebRateToAVRate(_ web: Double) -> Float {
+    // Clamp incoming web rate and map linearly, then apply a tiny skew.
+    let clamped = max(0.0, min(1.5, web))
+    var mapped = IOS_RATE_MIN + (clamped / 1.5) * (IOS_RATE_MAX - IOS_RATE_MIN)
+    mapped = max(IOS_RATE_MIN, min(IOS_RATE_MAX, mapped + IOS_RATE_SKEW))
+    return Float(mapped)
+}
+
+// ----------------------------------------------------------------------------
 // Args (all optional except text) — stays compatible with your Rust side
 // ----------------------------------------------------------------------------
 class SpeakArgs: Decodable {
     let text: String
     let language: String?  // e.g. "fa-IR" or "fa"
     let voiceIdentifier: String?  // force specific voice if known
-    let rate: Double?  // AVSpeechUtterance rate (0.0..1.0+, default ~0.5)
+    let rate: Double?  // web-style 0.0..1.5
     let pitch: Double?  // 0.5..2.0 (1.0 default)
     let volume: Double?  // 0.0..1.0
 }
@@ -38,7 +54,6 @@ enum SpeakError: Error {
 // ----------------------------------------------------------------------------
 final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
     private static let synth = AVSpeechSynthesizer()  // keep alive across calls
-    private var currentInvoke: Invoke?
 
     override init() {
         super.init()
@@ -194,8 +209,9 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
 
             // Prosody
             if let r = args.rate {
-                utter.rate = Float(r)
+                utter.rate = mapWebRateToAVRate(r)
             } else {
+                // If the caller omitted rate, keep Apple's default (usually ≈ 0.5).
                 utter.rate = AVSpeechUtteranceDefaultSpeechRate
             }
             if let p = args.pitch { utter.pitchMultiplier = Float(p) }
@@ -205,19 +221,15 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
                 utter.volume)
 
             // Speak
-            self.currentInvoke = invoke
             Self.synth.speak(utter)
             ttsLog("synth.speak() queued.")
 
-            // Report back: if Persian requested but not used, tell JS to prompt the user to install it.
+            // Report back immediately with fallback info if Persian wasn't honored.
             var response: [String: Any] = ["ok": true]
-
             if let wantedRaw = args.language {
                 let wantedBase = self.baseLang(self.normalizeTag(wantedRaw))
                 let usedBase = usedTag.map(self.baseLang)
-
                 if wantedBase == "fa", usedBase != "fa" {
-                    // We fell back (likely to Arabic or system default); inform the app.
                     response["fallback"] = [
                         "wanted": "fa",
                         "used": usedTag ?? "system",
@@ -225,8 +237,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
                     ]
                 }
             }
-
-            invoke.resolve(response)  // resolve with info (still fine if caller ignores)
+            invoke.resolve(response)
         }
     }
 
@@ -244,20 +255,16 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         invoke.resolve(speaking)
     }
 
-    // MARK: - AVSpeechSynthesizerDelegate (optional lifecycle logs)
+    // MARK: - AVSpeechSynthesizerDelegate (logging only; no resolving here)
     func speechSynthesizer(
         _ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance
     ) {
         ttsLog("delegate didFinish")
-        currentInvoke?.resolve()
-        currentInvoke = nil
     }
     func speechSynthesizer(
         _ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance
     ) {
         ttsLog("delegate didCancel")
-        currentInvoke?.reject("cancelled")
-        currentInvoke = nil
     }
     func speechSynthesizer(
         _ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance

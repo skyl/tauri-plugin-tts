@@ -13,6 +13,11 @@ tauri = { version = "2.1.0" }
 serde = "1.0"
 thiserror = "2"
 
+# macOS-only deps (so Linux/Windows builds don't pull them)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+cocoa = "0.24"
+
 [build-dependencies]
 tauri-plugin = { version = "2.0.2", features = ["build"] }
 tauri-build = "2.0.2"

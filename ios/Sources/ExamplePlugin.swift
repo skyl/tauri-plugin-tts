@@ -1,30 +1,28 @@
 import AVFoundation
 import Tauri
-import os
+// ----------------------------------------------------------------------------
+// Logging that appears in `tauri ios dev` console (Unified Logging)
+// ----------------------------------------------------------------------------
+import os.log
 
 #if canImport(UIKit)
     import UIKit
 #endif
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Logging: goes to unified logging with subsystem captured by `tauri ios dev`
-// ──────────────────────────────────────────────────────────────────────────────
-private let DEBUG_TTS = true
-private let osLogger = Logger(subsystem: "com.corpora.corpan", category: "TTS")
-
+private let TTS_SUBSYSTEM = "com.corpora.corpan"
+private let TTS_CATEGORY = "TTS"
+private let ttsLogObj = OSLog(subsystem: TTS_SUBSYSTEM, category: TTS_CATEGORY)
 @inline(__always) private func ttsLog(_ items: Any...) {
-    let msg = items.map { "\($0)" }.joined(separator: " ")
-    osLogger.info("\(msg, privacy: .public)")
-    if DEBUG_TTS { print("[TTS:iOS]", msg) }
+    os_log("%{public}@", log: ttsLogObj, type: .info, items.map { "\($0)" }.joined(separator: " "))
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Args (all optional except text) — stays compatible with Rust side
-// ──────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
+// Args (all optional except text) — stays compatible with your Rust side
+// ----------------------------------------------------------------------------
 class SpeakArgs: Decodable {
     let text: String
     let language: String?  // e.g. "fa-IR" or "fa"
-    let voiceIdentifier: String?  // force a specific voice if you know it
+    let voiceIdentifier: String?  // force specific voice if known
     let rate: Double?  // AVSpeechUtterance rate (0.0..1.0+, default ~0.5)
     let pitch: Double?  // 0.5..2.0 (1.0 default)
     let volume: Double?  // 0.0..1.0
@@ -35,12 +33,11 @@ enum SpeakError: Error {
     case invalidArgs(String)
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 // Speaker
-// ──────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
-    // Keep synthesizer alive across calls
-    private static let synth = AVSpeechSynthesizer()
+    private static let synth = AVSpeechSynthesizer()  // keep alive across calls
     private var currentInvoke: Invoke?
 
     override init() {
@@ -54,6 +51,10 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         return tag.lowercased().replacingOccurrences(of: "_", with: "-")
     }
 
+    private func baseLang(_ tag: String) -> String {
+        return tag.split(separator: "-").first.map(String.init) ?? tag
+    }
+
     // Prefer "fa-IR" when only "fa" is provided
     private func exactHint(for want: String) -> String? {
         switch want {
@@ -62,18 +63,34 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         }
     }
 
-    // Voice selection logic:
-    // 1) by identifier
-    // 2) exact language (normalized)
-    // 3) base language match (normalized, prefix or exact)
-    // 4) nil (system default; we’ll still try AVSpeechSynthesisVoice(language:))
-    private func selectVoice(language: String?, identifier: String?) -> AVSpeechSynthesisVoice? {
+    // Build ordered candidates we will try (strings are already normalized)
+    private func candidateTags(for wantRaw: String) -> [String] {
+        let want = normalizeTag(wantRaw)  // e.g., "fa-ir"
+        let base = baseLang(want)  // e.g., "fa"
+
+        var list: [String] = []
+        if base == "fa" { list.append("fa-ir") }  // strong preference
+
+        list.append(want)  // exact
+        if base != want { list.append(base) }  // base
+
+        // last-ditch: Arabic reads the script (not Persian phonology)
+        list.append(contentsOf: ["ar-001", "ar"])
+
+        // de-dup preserving order
+        var seen = Set<String>()
+        return list.filter { seen.insert($0).inserted }
+    }
+
+    // Try to find a concrete installed voice by identifier or language tag(s)
+    private func selectInstalledVoice(language: String?, identifier: String?)
+        -> AVSpeechSynthesisVoice?
+    {
         let voices = AVSpeechSynthesisVoice.speechVoices()
         ttsLog(
             "selectVoice: voices:", voices.count,
             "| want language:", language ?? "nil",
-            "| want id:", identifier ?? "nil"
-        )
+            "| want id:", identifier ?? "nil")
 
         if let id = identifier, let v = voices.first(where: { $0.identifier == id }) {
             ttsLog("selectVoice: matched by identifier:", v.name, v.language, v.identifier)
@@ -81,37 +98,36 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         }
 
         guard let langRaw = language, !langRaw.isEmpty else {
-            ttsLog("selectVoice: no language provided; returning nil (system default)")
+            ttsLog("selectVoice: no language provided; returning nil")
             return nil
         }
 
-        let want = normalizeTag(langRaw)
-
-        // exact hint first (e.g. fa -> fa-ir)
-        if let hint = exactHint(for: want),
+        // Try exact hint (fa -> fa-ir) before general candidates
+        if let hint = exactHint(for: normalizeTag(langRaw)),
             let v = voices.first(where: { $0.language.lowercased() == hint })
         {
             ttsLog("selectVoice: matched hint", hint, "->", v.name, v.language)
             return v
         }
 
-        // exact language
-        if let v = voices.first(where: { $0.language.lowercased() == want }) {
-            ttsLog("selectVoice: matched exact language:", want, "->", v.name, v.language)
-            return v
+        for tag in candidateTags(for: langRaw) {
+            // exact tag
+            if let v = voices.first(where: { $0.language.lowercased() == tag }) {
+                ttsLog("selectVoice: matched", tag, "->", v.name, v.language)
+                return v
+            }
+            // base family (fa matches fa-IR, fa-AF, etc.)
+            let base = baseLang(tag)
+            if let v = voices.first(where: {
+                let l = $0.language.lowercased()
+                return l == base || l.hasPrefix(base + "-")
+            }) {
+                ttsLog("selectVoice: matched base", base, "->", v.name, v.language)
+                return v
+            }
         }
 
-        // base language
-        let base = want.split(separator: "-").first.map(String.init) ?? want
-        if let v = voices.first(where: {
-            let l = $0.language.lowercased()
-            return l == base || l.hasPrefix(base + "-")
-        }) {
-            ttsLog("selectVoice: matched base language:", base, "->", v.name, v.language)
-            return v
-        }
-
-        ttsLog("selectVoice: no voice matched for", want)
+        ttsLog("selectVoice: no installed voice for", langRaw)
         return nil
     }
 
@@ -132,39 +148,45 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
     func speak(_ args: SpeakArgs, invoke: Invoke) {
         DispatchQueue.main.async {
             ttsLog(
-                "speak()",
-                "| lang:", args.language ?? "nil",
+                "speak() | lang:", args.language ?? "nil",
                 "| id:", args.voiceIdentifier ?? "nil",
                 "| rate:", args.rate ?? -1,
                 "| pitch:", args.pitch ?? -1,
-                "| volume:", args.volume ?? -1
-            )
+                "| volume:", args.volume ?? -1)
 
             self.prepareAudioSessionIfNeeded()
 
-            // Interrupt any current speech
             if Self.synth.isSpeaking {
-                ttsLog("Synth currently speaking; stopping immediately.")
+                ttsLog("Synth already speaking; stopping before new utterance.")
                 Self.synth.stopSpeaking(at: .immediate)
             }
 
             let utter = AVSpeechUtterance(string: args.text)
 
-            // 1) Try explicit installed voice
-            if let v = self.selectVoice(language: args.language, identifier: args.voiceIdentifier) {
+            // Choose a voice
+            var usedTag: String? = nil
+            if let v = self.selectInstalledVoice(
+                language: args.language, identifier: args.voiceIdentifier)
+            {
                 utter.voice = v
+                usedTag = v.language.lowercased()
                 ttsLog("Using installed voice:", v.name, v.language, "[", v.identifier, "]")
-            }
-            // 2) Else attempt model by language tag (helps when not enumerated)
-            else if let lang = args.language {
-                let normalized = self.normalizeTag(lang)
-                if let model = AVSpeechSynthesisVoice(language: normalized) {
-                    utter.voice = model
-                    ttsLog(
-                        "Using AVSpeechSynthesisVoice(language:)", normalized, "->", model.name,
-                        model.language)
-                } else {
-                    ttsLog("No AVSpeechSynthesisVoice for", normalized, "— using system default")
+            } else if let lang = args.language {
+                // Try creating a model voice with our candidate tags
+                var bound = false
+                for tag in self.candidateTags(for: lang) {
+                    if let model = AVSpeechSynthesisVoice(language: tag) {
+                        utter.voice = model
+                        usedTag = model.language.lowercased()
+                        ttsLog(
+                            "Using AVSpeechSynthesisVoice(language:)", tag, "->", model.name,
+                            model.language)
+                        bound = true
+                        break
+                    }
+                }
+                if !bound {
+                    ttsLog("No AVSpeechSynthesisVoice for", lang, "— using system default")
                 }
             } else {
                 ttsLog("No language/identifier; system default voice will be used.")
@@ -178,23 +200,39 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
             }
             if let p = args.pitch { utter.pitchMultiplier = Float(p) }
             if let v = args.volume { utter.volume = Float(v) }
-
             ttsLog(
                 "Prosody -> rate:", utter.rate, "pitch:", utter.pitchMultiplier, "volume:",
                 utter.volume)
 
+            // Speak
             self.currentInvoke = invoke
             Self.synth.speak(utter)
             ttsLog("synth.speak() queued.")
 
-            // Fire-and-forget; resolve now (delegate will also resolve on finish).
-            invoke.resolve()
+            // Report back: if Persian requested but not used, tell JS to prompt the user to install it.
+            var response: [String: Any] = ["ok": true]
+
+            if let wantedRaw = args.language {
+                let wantedBase = self.baseLang(self.normalizeTag(wantedRaw))
+                let usedBase = usedTag.map(self.baseLang)
+
+                if wantedBase == "fa", usedBase != "fa" {
+                    // We fell back (likely to Arabic or system default); inform the app.
+                    response["fallback"] = [
+                        "wanted": "fa",
+                        "used": usedTag ?? "system",
+                        "recommendInstall": true,
+                    ]
+                }
+            }
+
+            invoke.resolve(response)  // resolve with info (still fine if caller ignores)
         }
     }
 
     func stop(_ invoke: Invoke) {
         DispatchQueue.main.async {
-            ttsLog("stop()")
+            ttsLog("stop() called.")
             Self.synth.stopSpeaking(at: .immediate)
             invoke.resolve()
         }
@@ -206,13 +244,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         invoke.resolve(speaking)
     }
 
-    // MARK: - AVSpeechSynthesizerDelegate
-    func speechSynthesizer(
-        _ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance
-    ) {
-        ttsLog("delegate didStart")
-    }
-
+    // MARK: - AVSpeechSynthesizerDelegate (optional lifecycle logs)
     func speechSynthesizer(
         _ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance
     ) {
@@ -220,7 +252,6 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         currentInvoke?.resolve()
         currentInvoke = nil
     }
-
     func speechSynthesizer(
         _ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance
     ) {
@@ -228,9 +259,14 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         currentInvoke?.reject("cancelled")
         currentInvoke = nil
     }
+    func speechSynthesizer(
+        _ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance
+    ) {
+        ttsLog("delegate didStart")
+    }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 class TTSPlugin: Plugin {
     private static var speaker = Speaker()
 
@@ -264,8 +300,7 @@ class TTSPlugin: Plugin {
                 "quality": v.quality.rawValue,
             ]
         }
-        // Wrap in a dictionary so it matches Invoke.resolve(JsonObject)
-        invoke.resolve(["voices": vs])
+        invoke.resolve(["voices": vs])  // JsonObject
     }
 }
 

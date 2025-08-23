@@ -24,8 +24,17 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct Tts<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> Tts<R> {
-    pub fn speak(&self, text: String, language: Option<String>) -> crate::Result<()> {
-        let args = SpeakArgs { text, language };
+    pub fn speak(
+        &self,
+        text: String,
+        language: Option<String>,
+        rate: Option<f32>, // NEW (optional)
+    ) -> crate::Result<()> {
+        let args = SpeakArgs {
+            text,
+            language,
+            rate,
+        };
         self.0.run_mobile_plugin("speak", Some(args)).map_err(|e| {
             println!("Speech error: {:?}", e); // Debug log
             e.into()

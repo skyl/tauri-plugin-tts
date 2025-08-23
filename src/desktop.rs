@@ -135,7 +135,7 @@ mod macos_impl {
     fn map_web_rate_to_macos_wpm(web_rate: f32) -> f32 {
         // Clamp a Web-style rate (0.1..2.0) into macOS WPM range ~120–360.
         let r = web_rate.clamp(0.1, 2.0);
-        120.0 + (r - 0.1) * (240.0 / 1.9)
+        77.0 + (r - 0.1) * (255.0 / 1.9)
     }
 
     pub(super) fn macos_speak(

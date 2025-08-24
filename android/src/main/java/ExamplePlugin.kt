@@ -17,10 +17,11 @@ import java.util.UUID
 internal class SpeakArgs {
     lateinit var text: String
     var language: String? = null
+    var rate: Float? = null // New: Optional rate (0.0 to 2.0, default 1.0)
 }
 
 @TauriPlugin
-class ExamplePlugin(private val activity: Activity): Plugin(activity) {
+class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
     private var tts: TextToSpeech? = null
     private var isInitialized = false
 
@@ -54,13 +55,38 @@ class ExamplePlugin(private val activity: Activity): Plugin(activity) {
         try {
             val args = invoke.parseArgs(SpeakArgs::class.java)
 
+            // Set rate if provided (clamp to 0.5..2.0 for Android compatibility)
+            args.rate?.let { rate ->
+                val clampedRate = rate.coerceIn(0.5f, 2.0f)
+                tts?.setSpeechRate(clampedRate)
+            } ?: tts?.setSpeechRate(1.0f) // Default to 1.0 if not provided
+
+            // Language handling with fa -> ar fallback
             args.language?.let { lang ->
                 try {
+                    // Try primary language (e.g., "fa" or "fa-IR")
                     val locale = Locale.forLanguageTag(lang)
-                    val result = tts?.setLanguage(locale)
+                    var result = tts?.setLanguage(locale)
                     if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                        invoke.reject("Language not supported: $lang")
-                        return
+                        // Fallback to Arabic if Farsi ("fa") requested
+                        if (lang.lowercase().startsWith("fa")) {
+                            val fallbackLocale = Locale("ar")
+                            result = tts?.setLanguage(fallbackLocale)
+                            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                                invoke.reject("Neither Farsi nor Arabic supported")
+                                return
+                            }
+                            // Notify TypeScript of fallback
+                            val ret = JSObject()
+                            ret.put("fallback", JSObject().apply {
+                                put("wanted", "fa")
+                                put("used", "ar")
+                            })
+                            trigger("ttsLanguageFallback", ret)
+                        } else {
+                            invoke.reject("Language not supported: $lang")
+                            return
+                        }
                     }
                 } catch (e: Exception) {
                     invoke.reject("Invalid language code: $lang")
@@ -81,8 +107,6 @@ class ExamplePlugin(private val activity: Activity): Plugin(activity) {
                     val ret = JSObject()
                     ret.put("success", true)
                     invoke.resolve(ret)
-                    // ??
-                    // invoke.resolve(null) // ensure compatibility with Tauri Rust layer
                 }
 
                 override fun onError(utteranceId: String?) {

@@ -17,7 +17,7 @@ import java.util.UUID
 internal class SpeakArgs {
     lateinit var text: String
     var language: String? = null
-    var rate: Float? = null // New: Optional rate (0.0 to 2.0, default 1.0)
+    var rate: Float? = null // Optional rate (0.0 to 1.5, maps quadratically to 0.5–3.0)
 }
 
 @TauriPlugin
@@ -55,10 +55,14 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
         try {
             val args = invoke.parseArgs(SpeakArgs::class.java)
 
-            // Set rate if provided (clamp to 0.5..2.0 for Android compatibility)
+            // Set rate if provided (quadratic mapping: 0.5->0.5f, 1.0->1.0f, 1.5->3.0f)
             args.rate?.let { rate ->
-                val clampedRate = rate.coerceIn(0.5f, 2.0f)
-                tts?.setSpeechRate(clampedRate)
+                // // Clamp TypeScript rate to 0.0–1.5 (matches browser/iOS)
+                // val clampedRate = rate.coerceIn(0.0f, 1.5f)
+                // // Quadratic mapping: androidRate = 3.0 * rate^2 - 3.5 * rate + 1.5
+                // val androidRate = (3.0f * clampedRate * clampedRate - 3.5f * clampedRate + 1.5f)
+                //     .coerceIn(0.5f, 3.0f) // Ensure no invalid rates
+                tts?.setSpeechRate(rate + 0.01f)
             } ?: tts?.setSpeechRate(1.0f) // Default to 1.0 if not provided
 
             // Language handling with fa -> ar fallback

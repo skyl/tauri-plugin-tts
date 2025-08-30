@@ -224,20 +224,20 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
             Self.synth.speak(utter)
             ttsLog("synth.speak() queued.")
 
-            // Report back immediately with fallback info if Persian wasn't honored.
-            var response: [String: Any] = ["ok": true]
-            if let wantedRaw = args.language {
-                let wantedBase = self.baseLang(self.normalizeTag(wantedRaw))
-                let usedBase = usedTag.map(self.baseLang)
-                if wantedBase == "fa", usedBase != "fa" {
-                    response["fallback"] = [
-                        "wanted": "fa",
-                        "used": usedTag ?? "system",
-                        "recommendInstall": true,
-                    ]
-                }
-            }
-            invoke.resolve(response)
+            // // Report back immediately with fallback info if Persian wasn't honored.
+            // var response: [String: Any] = ["ok": true]
+            // if let wantedRaw = args.language {
+            //     let wantedBase = self.baseLang(self.normalizeTag(wantedRaw))
+            //     let usedBase = usedTag.map(self.baseLang)
+            //     if wantedBase == "fa", usedBase != "fa" {
+            //         response["fallback"] = [
+            //             "wanted": "fa",
+            //             "used": usedTag ?? "system",
+            //             "recommendInstall": true,
+            //         ]
+            //     }
+            // }
+            invoke.resolve()
         }
     }
 

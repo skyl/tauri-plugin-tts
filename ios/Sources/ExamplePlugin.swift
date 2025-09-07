@@ -20,9 +20,9 @@ private let ttsLogObj = OSLog(subsystem: TTS_SUBSYSTEM, category: TTS_CATEGORY)
 // Rate mapping (WEB 0.0..1.5  ->  iOS utter.rate ≈ 0.2..0.8)
 // Adjust these three if “normal” feels a hair too fast/slow.
 // ----------------------------------------------------------------------------
-private let IOS_RATE_MIN: Double = 0.20  // lower bound of utter.rate
-private let IOS_RATE_MAX: Double = 0.80  // upper bound of utter.rate
-private let IOS_RATE_SKEW: Double = -0.05  // small global nudge; negative = slightly slower
+private let IOS_RATE_MIN: Double = 0.03  // lower bound of utter.rate
+private let IOS_RATE_MAX: Double = 0.73  // upper bound of utter.rate
+private let IOS_RATE_SKEW: Double = -0.03  // small global nudge; negative = slightly slower
 
 private func mapWebRateToAVRate(_ web: Double) -> Float {
     // Clamp incoming web rate and map linearly, then apply a tiny skew.

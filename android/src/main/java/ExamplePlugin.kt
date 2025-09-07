@@ -13,6 +13,42 @@ import app.tauri.plugin.JSObject
 import java.util.Locale
 import java.util.UUID
 
+import kotlin.math.ln
+
+private fun mapWebRateToAndroid(
+    webRate: Float,
+    targetMax: Float = 2.0f   // push 1.5 → ~3.0 for clearly-fast speech
+): Float {
+    // Web semantics
+    val W_MIN = 0.10f
+    val W_DEF = 1.00f
+    val W_MAX = 1.50f
+
+    // Android semantics (relative multiplier; engines vary)
+    val A_MIN = 0.10f
+    val A_DEF = 1.00f
+    val A_MAX = targetMax
+
+    // small headroom to avoid edge weirdness in some engines
+    val pad = 0.02f * (A_MAX - A_MIN)
+    val lo = A_MIN + pad
+    val hi = A_MAX - pad
+
+    val w = webRate.coerceIn(W_MIN, W_MAX)
+
+    if (kotlin.math.abs(w - W_DEF) < 1e-6f) return A_DEF
+
+    return if (w < W_DEF) {
+        // [0.1..1.0) → [lo..A_DEF] (log scale)
+        val progress = (ln((w / W_MIN).toDouble()) / ln((W_DEF / W_MIN).toDouble())).toFloat()
+        lo + progress * (A_DEF - lo)
+    } else {
+        // (1.0..1.5] → [A_DEF..hi] (log scale)
+        val progress = (ln((w / W_DEF).toDouble()) / ln((W_MAX / W_DEF).toDouble())).toFloat()
+        A_DEF + progress * (hi - A_DEF)
+    }
+}
+
 @InvokeArg
 internal class SpeakArgs {
     lateinit var text: String
@@ -55,15 +91,11 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
         try {
             val args = invoke.parseArgs(SpeakArgs::class.java)
 
-            // Set rate if provided (quadratic mapping: 0.5->0.5f, 1.0->1.0f, 1.5->3.0f)
             args.rate?.let { rate ->
-                // // Clamp TypeScript rate to 0.0–1.5 (matches browser/iOS)
-                // val clampedRate = rate.coerceIn(0.0f, 1.5f)
-                // // Quadratic mapping: androidRate = 3.0 * rate^2 - 3.5 * rate + 1.5
-                // val androidRate = (3.0f * clampedRate * clampedRate - 3.5f * clampedRate + 1.5f)
-                //     .coerceIn(0.5f, 3.0f) // Ensure no invalid rates
-                tts?.setSpeechRate(rate + 0.01f)
-            } ?: tts?.setSpeechRate(1.0f) // Default to 1.0 if not provided
+                val androidRate = mapWebRateToAndroid(rate, targetMax = 3.0f)
+                tts?.setSpeechRate(androidRate)
+            } ?: tts?.setSpeechRate(1.0f)
+
 
             // Language handling with fa -> ar fallback
             args.language?.let { lang ->

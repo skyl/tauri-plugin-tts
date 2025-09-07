@@ -156,10 +156,10 @@ mod macos_impl {
         //  - max ≈ 1.0
         const AV_MIN: f32 = 0.00;
         const AV_DEF: f32 = 0.50;
-        const AV_MAX: f32 = 1.00;
+        const AV_MAX: f32 = 0.70;
 
         // keep a little headroom off the hard endpoints to avoid engine quirks
-        const PAD: f32 = 0.02;
+        const PAD: f32 = 0.01;
 
         let w = clamp(web_rate, W_MIN, W_MAX);
 

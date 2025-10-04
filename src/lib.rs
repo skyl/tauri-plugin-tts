@@ -1,3 +1,4 @@
+// src/lib.rs
 use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
@@ -38,18 +39,31 @@ tauri::ios_plugin_binding!(init_plugin_tts);
 /// Initializes the plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("tts")
-        .invoke_handler(tauri::generate_handler![commands::speak, commands::stop])
+        .invoke_handler(tauri::generate_handler![
+            commands::speak,
+            commands::stop,
+            commands::open_tts_settings,
+            commands::install_tts_data_if_supported,
+            commands::list_voices
+        ])
         .setup(|app, api| {
+            // --- Mobile (Android/iOS) ---
             #[cfg(mobile)]
-            let tts = mobile::init(app, api)?;
-            // #[cfg(target_os = "ios")]
-            // app.register_ios_plugin(init_plugin_tts)?;
+            {
+                let tts = mobile::init(app, api)?;
+                app.manage(tts);
 
-            println!("plugin init");
+                // If you use an iOS Swift binding, uncomment:
+                // #[cfg(target_os = "ios")]
+                // app.register_ios_plugin(init_plugin_tts)?;
+            }
 
+            // --- Desktop (macOS, etc.) ---
             #[cfg(desktop)]
-            let tts = desktop::init(app, api)?;
-            app.manage(tts);
+            {
+                let tts = desktop::init(app, api)?;
+                app.manage(tts);
+            }
 
             Ok(())
         })

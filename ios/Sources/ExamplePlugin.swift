@@ -6,6 +6,9 @@ import os.log
     import UIKit
 #endif
 
+// -----------------------------------------------------------------------------
+// Logging
+// -----------------------------------------------------------------------------
 private let TTS_SUBSYSTEM = "com.corpora.corpan"
 private let TTS_CATEGORY = "TTS"
 private let ttsLogObj = OSLog(subsystem: TTS_SUBSYSTEM, category: TTS_CATEGORY)
@@ -13,53 +16,78 @@ private let ttsLogObj = OSLog(subsystem: TTS_SUBSYSTEM, category: TTS_CATEGORY)
     os_log("%{public}@", log: ttsLogObj, type: .info, items.map { "\($0)" }.joined(separator: " "))
 }
 
-// ----------------------------------------------------------------------------
-// Rate mapping (WEB 0.0..1.5  ->  iOS utter.rate ≈ 0.2..0.8)
-// ----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Rate mapping (WEB ~0.1..1.5 → AVSpeech 0.03..0.73 with a slight skew)
+// -----------------------------------------------------------------------------
 private let IOS_RATE_MIN: Double = 0.03
 private let IOS_RATE_MAX: Double = 0.73
 private let IOS_RATE_SKEW: Double = -0.03
 
 private func mapWebRateToAVRate(_ web: Double) -> Float {
-    let clamped = max(0.0, min(1.5, web))
+    let clamped = max(0.1, min(1.5, web))
     var mapped = IOS_RATE_MIN + (clamped / 1.5) * (IOS_RATE_MAX - IOS_RATE_MIN)
     mapped = max(IOS_RATE_MIN, min(IOS_RATE_MAX, mapped + IOS_RATE_SKEW))
     return Float(mapped)
 }
 
-// ----------------------------------------------------------------------------
-// Args (all optional except text)
-// ----------------------------------------------------------------------------
-class SpeakArgs: Decodable {
+// -----------------------------------------------------------------------------
+// Args (Decodable). Accept both "voiceId" and "voice_id" for robustness.
+// -----------------------------------------------------------------------------
+final class SpeakArgs: Decodable {
     let text: String
-    let language: String?  // e.g. "en-US"
-    let voiceIdentifier: String?  // accepted but ranking ignores it unless valid
+    let language: String?
+    let voiceId: String?
     let rate: Double?
     let pitch: Double?
     let volume: Double?
+
+    private enum CodingKeys: String, CodingKey {
+        case text, language, voiceId, voice_id, rate, pitch, volume
+    }
+
+    init(
+        text: String, language: String?, voiceId: String?, rate: Double?, pitch: Double?,
+        volume: Double?
+    ) {
+        self.text = text
+        self.language = language
+        self.voiceId = voiceId
+        self.rate = rate
+        self.pitch = pitch
+        self.volume = volume
+    }
+
+    convenience init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let text = try c.decode(String.self, forKey: .text)
+        let language = try c.decodeIfPresent(String.self, forKey: .language)
+        let voiceId =
+            try c.decodeIfPresent(String.self, forKey: .voiceId)
+            ?? c.decodeIfPresent(String.self, forKey: .voice_id)
+        let rate = try c.decodeIfPresent(Double.self, forKey: .rate)
+        let pitch = try c.decodeIfPresent(Double.self, forKey: .pitch)
+        let volume = try c.decodeIfPresent(Double.self, forKey: .volume)
+        self.init(
+            text: text, language: language, voiceId: voiceId, rate: rate, pitch: pitch,
+            volume: volume)
+    }
 }
 
-enum SpeakError: Error {
-    case speakerNotReady
-    case invalidArgs(String)
-}
-
-// ----------------------------------------------------------------------------
-// Speaker
-// ----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Speaker (voice picking, audio session, speak/stop)
+// -----------------------------------------------------------------------------
 final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
     private static let synth = AVSpeechSynthesizer()
 
-    // Novelty/legacy constants
+    // Known “novelty/legacy” markers to avoid for production TTS
     private static let NOVELTY_TOKENS: [String] = [
         "trinoids", "bubbles", "bad", "zarvox", "boing", "hysterical", "pipe",
-        "agnes", "albert", "fred", "junior", "kathy", "princess", "bahh", "cellos", "deranged",
-        "bells", "whisper",
+        "agnes", "albert", "fred", "junior", "kathy", "princess", "bahh", "cellos",
+        "deranged", "bells", "whisper",
     ]
-    private static let LEGACY_PREFIX = "com.apple.speech.synthesis.voice."
-    private static let MODERN_MARK = ".ttsbundle."
+    private static let LEGACY_PREFIX = "com.apple.speech.synthesis.voice."  // old AppKit catalog
 
-    // Quality tokens (in identifiers/names). Tier: Premium(4) > Enhanced(3) > Siri(2) > Modern(1)
+    // Quality tokens (best → worst): Premium(4) > Enhanced(3) > Siri(2) > Modern default(1)
     private static let PREMIUM_TOKENS = ["premium", "neural", "natural", "studio", "hq", "pro"]
     private static let ENHANCED_TOKENS = ["enhanced", "improved", "hd"]
     private static let SIRI_TOKENS = ["siri"]
@@ -70,14 +98,9 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         let all = AVSpeechSynthesisVoice.speechVoices()
         ttsLog("TTS init | voices:", all.count)
         ttsLog("TTS catalog |", Self.voicesSummaryLine(all))
-        #if targetEnvironment(simulator)
-            ttsLog(
-                "TTS note | Simulator: legacy/novelty filtered; will widen to base language if needed."
-            )
-        #endif
     }
 
-    // ---- Tag helpers --------------------------------------------------------
+    // Helpers
     private func normalizeTag(_ tag: String) -> String {
         tag.lowercased().replacingOccurrences(of: "_", with: "-")
     }
@@ -85,48 +108,25 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         tag.split(separator: "-").first.map(String.init) ?? tag
     }
 
-    // If caller passes bare language, add a gentle region hint
-    private func hintForBare(_ base: String) -> String? {
-        switch base {
-        case "pt": return "pt-br"
-        case "zh": return "zh-cn"
-        case "fa": return "fa-ir"
-        default: return nil
-        }
-    }
-
-    private func candidateTags(for wantRaw: String) -> [String] {
-        let want = normalizeTag(wantRaw)
-        let base = baseLang(want)
-        var list: [String] = []
-        if let h = hintForBare(base) { list.append(h) }
-        list.append(want)  // exact
-        if base != want { list.append(base) }  // base
-        var seen = Set<String>()
-        return list.filter { seen.insert($0).inserted }
-    }
-
-    // ---- Filtering & ranking ------------------------------------------------
     private func isLegacy(_ v: AVSpeechSynthesisVoice) -> Bool {
         v.identifier.hasPrefix(Self.LEGACY_PREFIX)
     }
     private func isNovelty(_ v: AVSpeechSynthesisVoice) -> Bool {
         let blob = (v.identifier + " " + v.name).lowercased()
-        return Self.NOVELTY_TOKENS.contains(where: { blob.contains($0) })
+        return Self.NOVELTY_TOKENS.contains { blob.contains($0) }
     }
     private func isModern(_ v: AVSpeechSynthesisVoice) -> Bool {
-        // Treat as modern unless explicitly legacy; Siri/others may not include .ttsbundle.
-        return !isLegacy(v)
+        !isLegacy(v)
     }
 
-    // Premium(4) > Enhanced(3) > Siri(2) > Modern default(1)
+    // Premium(4) > Enhanced(3) > Siri(2) > Modern(1) > Legacy(0)
     private func qualityTier(_ v: AVSpeechSynthesisVoice) -> Int {
         let id = v.identifier.lowercased()
         let name = v.name.lowercased()
         if Self.PREMIUM_TOKENS.contains(where: { id.contains($0) || name.contains($0) }) {
             return 4
         }
-        if v.quality.rawValue >= 2
+        if v.quality.rawValue >= 1 /* .enhanced == 1 */
             || Self.ENHANCED_TOKENS.contains(where: { id.contains($0) || name.contains($0) })
         {
             return 3
@@ -135,8 +135,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         return isModern(v) ? 1 : 0
     }
 
-    // 3 = exact "en-US" match, 2 = same base "en-*", 0 otherwise
-    private func langMatchScore(_ voiceTag: String, wantTag: String) -> Int {
+    private func langMatchScore(voiceTag: String, wantTag: String) -> Int {
         let v = voiceTag.lowercased()
         let w = wantTag.lowercased()
         if v == w { return 3 }
@@ -162,88 +161,67 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
             keep.append(v)
         }
         ttsLog(
-            "TTS filter | kept:", keep.count, "| dropped legacy:", droppedLegacy,
-            "| dropped novelty:", droppedNovelty)
+            "TTS filter | kept:", keep.count, "| legacy:", droppedLegacy, "| novelty:",
+            droppedNovelty)
         return keep
     }
 
-    // Core picker: try exact tag with best tier; if none, widen to base (en-*)
-    private func pickVoice(language wantLangRaw: String?) -> AVSpeechSynthesisVoice? {
+    private func pickBest(in pool: [AVSpeechSynthesisVoice], want: String)
+        -> AVSpeechSynthesisVoice?
+    {
+        guard !pool.isEmpty else { return nil }
+        return pool.max { a, b in
+            let la = langMatchScore(voiceTag: a.language, wantTag: want)
+            let lb = langMatchScore(voiceTag: b.language, wantTag: want)
+            if la != lb { return la < lb }
+            let qa = qualityTier(a)
+            let qb = qualityTier(b)
+            if qa != qb { return qa < qb }
+            if a.quality.rawValue != b.quality.rawValue {
+                return a.quality.rawValue < b.quality.rawValue
+            }
+            return a.name > b.name
+        }
+    }
+
+    private func pickVoice(language wantRaw: String?) -> AVSpeechSynthesisVoice? {
         let usable = allUsableVoices()
         guard !usable.isEmpty else { return nil }
 
-        guard let wantRaw = wantLangRaw, !wantRaw.isEmpty else {
-            // No language given → best overall by tier (premium/enhanced preferred)
-            return usable.max { a, b in
-                let qa = qualityTier(a)
-                let qb = qualityTier(b)
-                if qa != qb { return qa < qb }
-                if a.quality.rawValue != b.quality.rawValue {
-                    return a.quality.rawValue < b.quality.rawValue
-                }
-                return a.name > b.name
-            }
+        guard let wantRaw, !wantRaw.isEmpty else {
+            return pickBest(in: usable, want: "en-US")  // neutral-ish default
         }
 
         let want = normalizeTag(wantRaw)
         let base = baseLang(want)
 
-        // 1) Exact tag only (e.g., en-US)
         let exactPool = usable.filter { $0.language.lowercased() == want }
-        if let bestExact = rankBest(in: exactPool, want: want) { return bestExact }
+        if let bestExact = pickBest(in: exactPool, want: want) { return bestExact }
 
-        // 2) Same base language (e.g., en-*)
         let basePool = usable.filter {
             let l = $0.language.lowercased()
             return l == base || l.hasPrefix(base + "-")
         }
-        if let bestBase = rankBest(in: basePool, want: want) { return bestBase }
+        if let bestBase = pickBest(in: basePool, want: want) { return bestBase }
 
-        // 3) Nothing for that language family → leave unset (system default is safer than junk)
-        ttsLog("TTS select | no usable voices for", want, "or base", base, "— leaving voice unset.")
+        ttsLog(
+            "TTS select | no usable \(want) or base \(base); leave voice unset (system default).")
         return nil
     }
 
-    // Rank within a pool: prefer Premium > Enhanced > Siri > Modern; tiebreak by AV quality then name asc.
-    private func rankBest(in pool: [AVSpeechSynthesisVoice], want: String)
-        -> AVSpeechSynthesisVoice?
-    {
-        guard !pool.isEmpty else { return nil }
-        return pool.max { a, b in
-            let la = langMatchScore(a.language, wantTag: want)
-            let lb = langMatchScore(b.language, wantTag: want)
-            if la != lb { return la < lb }
-
-            let qa = qualityTier(a)
-            let qb = qualityTier(b)
-            if qa != qb { return qa < qb }
-
-            if a.quality.rawValue != b.quality.rawValue {
-                return a.quality.rawValue < b.quality.rawValue
-            }
-
-            return a.name > b.name
-        }
-    }
-
-    // Compact one-line summary of the entire catalog
+    // One-line summary of all voices (for diagnostics)
     static func voicesSummaryLine(_ list: [AVSpeechSynthesisVoice]) -> String {
-        let parts = list.map { v in
-            let q = v.quality.rawValue
-            // name@lang[q=2]{id}
-            return "\(v.name)@\(v.language)[q=\(q)]{\(v.identifier)}"
-        }
-        return parts.joined(separator: " | ")
+        list.map { v in "\(v.name)@\(v.language)[q=\(v.quality.rawValue)]{\(v.identifier)}" }
+            .joined(separator: " | ")
     }
 
-    // iOS needs an audio session; macOS doesn’t.
     private func prepareAudioSessionIfNeeded() {
         #if canImport(UIKit)
             do {
                 let session = AVAudioSession.sharedInstance()
                 try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
                 try session.setActive(true, options: [])
-                ttsLog("TTS audio | AVAudioSession playback/spokenAudio active")
+                ttsLog("TTS audio | AVAudioSession ready")
             } catch {
                 ttsLog("TTS audio | setup failed:", error.localizedDescription)
             }
@@ -254,7 +232,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         DispatchQueue.main.async {
             ttsLog(
                 "TTS speak | lang:", args.language ?? "nil",
-                "| id:", args.voiceIdentifier ?? "nil",
+                "| id:", args.voiceId ?? "nil",
                 "| rate:", args.rate ?? -1,
                 "| pitch:", args.pitch ?? -1,
                 "| volume:", args.volume ?? -1)
@@ -268,25 +246,21 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
 
             let utter = AVSpeechUtterance(string: args.text)
 
-            // Optional identifier (guarded)
-            if let id = args.voiceIdentifier,
+            // Prefer explicit voice by identifier
+            if let id = args.voiceId,
                 let v = AVSpeechSynthesisVoice.speechVoices().first(where: { $0.identifier == id }),
                 !self.isNovelty(v), !self.isLegacy(v)
             {
                 utter.voice = v
-                ttsLog("TTS voice | using identifier:", v.name, v.language, v.identifier)
+                ttsLog("TTS voice | using id:", v.name, v.language, v.identifier)
             }
 
-            // Rank by language if not set by identifier
-            if utter.voice == nil {
-                if let best = self.pickVoice(language: args.language) {
-                    utter.voice = best
-                    ttsLog(
-                        "TTS voice | selected:", best.name, best.language, "tier:",
-                        self.qualityTier(best), "avQ:", best.quality.rawValue, best.identifier)
-                } else {
-                    ttsLog("TTS voice | unset -> system default")
-                }
+            // Otherwise pick by language ranking
+            if utter.voice == nil, let best = self.pickVoice(language: args.language) {
+                utter.voice = best
+                ttsLog(
+                    "TTS voice | picked:", best.name, best.language, "tier:",
+                    self.qualityTier(best), "avQ:", best.quality.rawValue)
             }
 
             // Prosody
@@ -314,32 +288,48 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     func isSpeaking(_ invoke: Invoke) {
-        let speaking = Self.synth.isSpeaking
-        ttsLog("TTS state | isSpeaking:", speaking)
-        invoke.resolve(speaking)
+        invoke.resolve(Self.synth.isSpeaking)
     }
 
-    // MARK: - AVSpeechSynthesizerDelegate (minimal logging)
-    func speechSynthesizer(
-        _ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance
-    ) {
-        ttsLog("TTS delegate | didStart")
-    }
-    func speechSynthesizer(
-        _ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance
-    ) {
-        ttsLog("TTS delegate | didFinish")
-    }
-    func speechSynthesizer(
-        _ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance
-    ) {
-        ttsLog("TTS delegate | didCancel")
+    // listVoices payload matches Rust VoiceInfo: { id, name, language, gender, quality, engine }
+    func listVoices(_ invoke: Invoke) {
+        let all = AVSpeechSynthesisVoice.speechVoices()
+        let payload: [[String: Any?]] = all.map { v in
+            let genderStr: String? = {
+                if #available(iOS 13.0, macOS 10.15, *) {
+                    switch v.gender {
+                    case .male: return "male"
+                    case .female: return "female"
+                    case .unspecified: return "unspecified"
+                    @unknown default: return "unspecified"
+                    }
+                } else {
+                    return nil
+                }
+            }()
+
+            let qualityStr: String = (v.quality.rawValue >= 1) ? "enhanced" : "default"
+
+            return [
+                "id": v.identifier,
+                "name": v.name,
+                "language": v.language,
+                "gender": genderStr as Any?,
+                "quality": qualityStr,
+                "engine": nil,
+            ]
+        }
+        ttsLog("TTS catalog |", Speaker.voicesSummaryLine(all))
+        // IMPORTANT: Tauri iOS wants a JsonObject/JsonValue. Wrap the array in an object.
+        invoke.resolve(["voices": payload])
     }
 }
 
-// ----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Tauri Plugin surface (names must match run_mobile_plugin calls from Rust)
+// -----------------------------------------------------------------------------
 class TTSPlugin: Plugin {
-    private static var speaker = Speaker()
+    private static let speaker = Speaker()
 
     @objc public func speak(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(SpeakArgs.self)
@@ -350,26 +340,39 @@ class TTSPlugin: Plugin {
         Self.speaker.stop(invoke)
     }
 
-    @objc public func is_speaking(_ invoke: Invoke) {
+    // Not currently used by Rust, but handy for debugging.
+    @objc public func isSpeaking(_ invoke: Invoke) {
         Self.speaker.isSpeaking(invoke)
     }
 
-    // list_voices(): returns { voices: Array<{name, language, quality, identifier}> }
-    @objc public func list_voices(_ invoke: Invoke) {
-        let all = AVSpeechSynthesisVoice.speechVoices()
-        ttsLog("TTS catalog |", Speaker.voicesSummaryLine(all))  // single line dump
-        let vs: [[String: Any?]] = all.map { v in
-            [
-                "name": v.name, "language": v.language, "identifier": v.identifier,
-                "quality": v.quality.rawValue,
-            ]
-        }
-        invoke.resolve(["voices": vs])
+    // listVoices → returns { voices: [...] }
+    @objc public func listVoices(_ invoke: Invoke) {
+        Self.speaker.listVoices(invoke)
+    }
+
+    // openTtsSettings: iOS cannot deep-link to Spoken Content; open app’s Settings instead.
+    @objc public func openTtsSettings(_ invoke: Invoke) {
+        #if canImport(UIKit)
+            if let url = URL(string: UIApplication.openSettingsURLString),
+                UIApplication.shared.canOpenURL(url)
+            {
+                UIApplication.shared.open(url, options: [:]) { _ in
+                    invoke.resolve()
+                }
+                return
+            }
+        #endif
+        invoke.resolve()  // Best-effort; no-op on macOS
+    }
+
+    // installTtsDataIfSupported: Not supported on iOS → return false.
+    @objc public func installTtsDataIfSupported(_ invoke: Invoke) {
+        invoke.resolve(false)
     }
 }
 
 @_cdecl("init_plugin_tts")
-func initPlugin() -> Plugin {
-    ttsLog("TTS initPlugin()")
+func init_plugin_tts() -> Plugin {
+    ttsLog("TTS init_plugin_tts()")
     return TTSPlugin()
 }

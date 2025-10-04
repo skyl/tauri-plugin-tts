@@ -1,7 +1,10 @@
+// src/desktop.rs
 #![allow(unexpected_cfgs)] // quiet objc macro warnings in this file
 
 use serde::de::DeserializeOwned;
 use tauri::{plugin::PluginApi, AppHandle, Runtime};
+
+use crate::models::{VoiceGender, VoiceInfo, VoiceQuality};
 
 pub fn init<R: Runtime, C: DeserializeOwned>(
     app: &AppHandle<R>,
@@ -10,10 +13,11 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     Ok(Tts(app.clone()))
 }
 
-/// Access to the tts APIs.
+/// Access to the desktop TTS APIs.
 pub struct Tts<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> Tts<R> {
+    /// Back-compat entry point: speak without an explicit voice id
     pub fn speak(
         &self,
         text: String,
@@ -22,7 +26,45 @@ impl<R: Runtime> Tts<R> {
     ) -> crate::Result<()> {
         #[cfg(target_os = "macos")]
         {
-            macos_speak(&text, language.as_deref(), rate)?;
+            macos_impl::macos_speak_with_options(&text, language.as_deref(), rate, None)?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Non-macOS desktop is not handled by the native plugin; the app will fall back to Web Speech.
+            Ok(())
+        }
+    }
+
+    /// New entry point: speak with an optional explicit voice id
+    pub fn speak_with_options(
+        &self,
+        text: String,
+        language: Option<String>,
+        rate: Option<f32>,
+        voice_id: Option<String>,
+    ) -> crate::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            macos_impl::macos_speak_with_options(
+                &text,
+                language.as_deref(),
+                rate,
+                voice_id.as_deref(),
+            )?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Non-macOS desktop is not handled by the native plugin; the app will fall back to Web Speech.
+            Ok(())
+        }
+    }
+
+    pub fn stop(&self) -> crate::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            macos_impl::macos_stop()?;
             return Ok(());
         }
         #[cfg(not(target_os = "macos"))]
@@ -31,17 +73,67 @@ impl<R: Runtime> Tts<R> {
         }
     }
 
-    pub fn stop(&self) -> crate::Result<()> {
-        Ok(())
+    /// Open the closest-possible system UI for managing/downloading TTS voices.
+    pub fn open_tts_settings(&self) -> crate::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            macos_impl::macos_open_spoken_content()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(())
+        }
+    }
+
+    /// Best-effort programmatic voice install (Android only on mobile).
+    /// On desktop macOS, there is no programmatic install → return false.
+    pub fn install_tts_data_if_supported(&self) -> crate::Result<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(false)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(false)
+        }
+    }
+
+    /// Enumerate installed/available voices with cross-platform metadata.
+    pub fn list_voices(&self) -> crate::Result<Vec<VoiceInfo>> {
+        #[cfg(target_os = "macos")]
+        {
+            macos_impl::macos_list_voices()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(Vec::new())
+        }
     }
 }
 
-// macOS implementation using AVFoundation with quality ranking
+// -------------------------- macOS (AVFoundation) --------------------------
+
 #[cfg(target_os = "macos")]
 mod macos_impl {
-    use cocoa::base::id;
+    use super::*;
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::NSString; // bring the trait into scope for `init_str`
     use objc::{class, msg_send, sel, sel_impl};
     use std::ffi::CStr;
+    use std::sync::Once;
+
+    // Persistent synthesizer so `stop` can actually stop current speech.
+    static mut SYNTH: id = 0 as id;
+    static INIT: Once = Once::new();
+
+    fn with_synth<F: FnOnce(id)>(f: F) {
+        unsafe {
+            INIT.call_once(|| {
+                SYNTH = msg_send![class!(AVSpeechSynthesizer), new];
+            });
+            f(SYNTH);
+        }
+    }
 
     #[inline]
     unsafe fn nsstring_to_rust(ns: id) -> String {
@@ -52,6 +144,15 @@ mod macos_impl {
             CStr::from_ptr(c).to_string_lossy().into_owned()
         }
     }
+
+    // tiny helper for NSString literals; call sites are already in `unsafe` blocks
+    #[macro_export]
+    macro_rules! ns_string {
+        ($s:expr) => {{
+            cocoa::foundation::NSString::alloc(cocoa::base::nil).init_str($s)
+        }};
+    }
+    pub(super) use ns_string;
 
     #[inline]
     fn norm(tag: &str) -> String {
@@ -67,13 +168,13 @@ mod macos_impl {
         (want_lc, base)
     }
 
-    /// Rank voices: Enhanced > Default; then heuristics on name/identifier; stable tiebreaker by name.
+    /// Rank voices: exact lang > base match; Enhanced > Default; mild heuristic on name/id; stable tiebreaker by name.
     unsafe fn rank_voice(v: id, want_lang: &str, base_lang: &str) -> (i32, i32, i32, String) {
         let lang_ns: id = msg_send![v, language];
         let lang = nsstring_to_rust(lang_ns);
         let lang_lc = norm(&lang);
 
-        // 1 = default, 2 = enhanced (AVSpeechSynthesisVoiceQuality)
+        // AVSpeechSynthesisVoiceQuality: 0=Default, 1=Enhanced
         let quality: i64 = msg_send![v, quality];
 
         let name_ns: id = msg_send![v, name];
@@ -91,7 +192,7 @@ mod macos_impl {
             0
         };
 
-        let heuristic = ["enhanced", "premium", "siri", "natural", "neural", "hq"]
+        let heuristic = ["enhanced", "siri", "natural", "neural", "hq"]
             .iter()
             .any(|h| name_lc.contains(h) || ident_lc.contains(h)) as i32;
 
@@ -142,23 +243,14 @@ mod macos_impl {
     /// keeping 1.0 → 0.5 (AV default), with gentle padding at extremes.
     #[inline]
     fn map_web_rate_to_av(web_rate: f32) -> f32 {
-        // Web semantics (your app):
-        //  - ~0.1 very slow
-        //  - 1.0 normal
-        //  - ~1.5 very fast (almost too fast)
         const W_MIN: f32 = 0.10;
         const W_DEF: f32 = 1.00;
         const W_MAX: f32 = 1.50;
 
-        // AVFoundation semantics:
-        //  - min ≈ 0.0
-        //  - default = 0.5
-        //  - max ≈ 1.0
         const AV_MIN: f32 = 0.00;
         const AV_DEF: f32 = 0.50;
         const AV_MAX: f32 = 0.70;
 
-        // keep a little headroom off the hard endpoints to avoid engine quirks
         const PAD: f32 = 0.01;
 
         let w = clamp(web_rate, W_MIN, W_MAX);
@@ -174,15 +266,16 @@ mod macos_impl {
         }
     }
 
-    pub(super) fn macos_speak(
+    pub(super) fn macos_speak_with_options(
         text: &str,
         language: Option<&str>,
         rate: Option<f32>,
+        voice_id: Option<&str>,
     ) -> crate::Result<()> {
         unsafe {
             let utter: id = msg_send![
                 class!(AVSpeechUtterance),
-                speechUtteranceWithString: crate::ns_string!(text)
+                speechUtteranceWithString: ns_string!(text)
             ];
 
             if let Some(r) = rate {
@@ -190,34 +283,140 @@ mod macos_impl {
                 let _: () = msg_send![utter, setRate: mapped];
             }
 
-            if let Some(voice_id) = best_avfoundation_voice(language) {
-                let _: () = msg_send![utter, setVoice: voice_id];
-            } else if let Some(lang) = language {
-                let voice_for_lang: id = msg_send![
+            // Prefer explicit voice by identifier if provided.
+            if let Some(req_id) = voice_id {
+                let v_by_id: id = msg_send![
                     class!(AVSpeechSynthesisVoice),
-                    voiceWithLanguage: crate::ns_string!(lang)
+                    voiceWithIdentifier: ns_string!(req_id)
                 ];
-                if !voice_for_lang.is_null() {
-                    let _: () = msg_send![utter, setVoice: voice_for_lang];
+                if !v_by_id.is_null() {
+                    let _: () = msg_send![utter, setVoice: v_by_id];
+                } else if let Some(lang) = language {
+                    let v_lang: id = msg_send![
+                        class!(AVSpeechSynthesisVoice),
+                        voiceWithLanguage: ns_string!(lang)
+                    ];
+                    if !v_lang.is_null() {
+                        let _: () = msg_send![utter, setVoice: v_lang];
+                    } else if let Some(best) = best_avfoundation_voice(Some(lang)) {
+                        let _: () = msg_send![utter, setVoice: best];
+                    }
+                }
+            } else if let Some(lang) = language {
+                // Language-specific voice or best match.
+                let v_lang: id = msg_send![
+                    class!(AVSpeechSynthesisVoice),
+                    voiceWithLanguage: ns_string!(lang)
+                ];
+                if !v_lang.is_null() {
+                    let _: () = msg_send![utter, setVoice: v_lang];
+                } else if let Some(best) = best_avfoundation_voice(Some(lang)) {
+                    let _: () = msg_send![utter, setVoice: best];
                 }
             }
 
-            let synth: id = msg_send![class!(AVSpeechSynthesizer), new];
-            let _: () = msg_send![synth, speakUtterance: utter];
+            with_synth(|synth| {
+                let _: () = msg_send![synth, speakUtterance: utter];
+            });
         }
         Ok(())
     }
 
-    // tiny helper for NSString literals
-    #[macro_export]
-    macro_rules! ns_string {
-        ($s:expr) => {{
-            use cocoa::base::nil;
-            use cocoa::foundation::NSString;
-            unsafe { NSString::alloc(nil).init_str($s) }
-        }};
+    pub(super) fn macos_stop() -> crate::Result<()> {
+        unsafe {
+            with_synth(|synth| {
+                // 0 == immediate; 1 == word; 2 == sentence (AVSpeechBoundary)
+                let _: bool = msg_send![synth, stopSpeakingAtBoundary: 1i64];
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn macos_open_spoken_content() -> crate::Result<()> {
+        // Try most specific pane first, then fall back to Accessibility root
+        let candidates = &[
+            "x-apple.systempreferences:com.apple.preference.accessibility?SpokenContent",
+            "x-apple.systempreferences:com.apple.preference.universalaccess?SpokenContent",
+            "x-apple.systempreferences:com.apple.preference.accessibility",
+        ];
+
+        unsafe {
+            let ws: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            for s in candidates {
+                let url: id = msg_send![class!(NSURL), URLWithString: ns_string!(s)];
+                if url != nil {
+                    let ok: bool = msg_send![ws, openURL: url];
+                    if ok {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn macos_list_voices() -> crate::Result<Vec<VoiceInfo>> {
+        let mut out = Vec::new();
+        unsafe {
+            let voices: id = msg_send![class!(AVSpeechSynthesisVoice), speechVoices];
+            let count: usize = msg_send![voices, count];
+
+            for i in 0..count {
+                let v: id = msg_send![voices, objectAtIndex: i];
+
+                let ident_ns: id = msg_send![v, identifier];
+                let name_ns: id = msg_send![v, name];
+                let lang_ns: id = msg_send![v, language];
+
+                let id_str = nsstring_to_rust(ident_ns);
+                let name = {
+                    let s = nsstring_to_rust(name_ns);
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                };
+                let language = nsstring_to_rust(lang_ns);
+
+                // quality: 0=Default, 1=Enhanced
+                let q_raw: i64 = msg_send![v, quality];
+                let quality = match q_raw {
+                    1 => Some(VoiceQuality::Enhanced),
+                    0 => Some(VoiceQuality::Default),
+                    _ => None,
+                };
+
+                // gender (if available)
+                let gender = if responds_to_selector(v, sel!(gender)) {
+                    let g_raw: i64 = msg_send![v, gender];
+                    // 0=unspecified, 1=male, 2=female (Apple docs)
+                    match g_raw {
+                        1 => Some(VoiceGender::Male),
+                        2 => Some(VoiceGender::Female),
+                        0 => Some(VoiceGender::Unspecified),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                out.push(VoiceInfo {
+                    id: id_str,
+                    name,
+                    language,
+                    gender,
+                    quality,
+                    engine: None, // AVFoundation doesn't expose an engine/bundle here
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    #[inline]
+    unsafe fn responds_to_selector(obj: id, selector: objc::runtime::Sel) -> bool {
+        let yes: bool = msg_send![obj, respondsToSelector: selector];
+        yes
     }
 }
-
-#[cfg(target_os = "macos")]
-use macos_impl::macos_speak;

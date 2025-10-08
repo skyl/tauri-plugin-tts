@@ -29,21 +29,10 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct Tts<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> Tts<R> {
-    /// Back-compat entry point: speak without an explicit voice id.
-    /// Prefer calling `speak_with_options` if you have a `voice_id`.
-    pub fn speak(
-        &self,
-        text: String,
-        language: Option<String>,
-        rate: Option<f32>,
-    ) -> crate::Result<()> {
-        self.speak_with_options(text, language, rate, None)
-    }
-
     /// New entry point: speak with an optional explicit `voice_id`.
     /// The native mobile plugins should accept `voice_id` and pick that exact system voice
     /// (Android: Voice.getName(), iOS: AVSpeechSynthesisVoice.identifier).
-    pub fn speak_with_options(
+    pub fn speak(
         &self,
         text: String,
         language: Option<String>,

@@ -1,10 +1,14 @@
 ## Default Permission
 
-Default permissions for the plugin
+Default permissions for the TTS plugin
 
 #### This default permission set includes the following:
 
-- `allow-ping`
+- `allow-speak`
+- `allow-stop`
+- `allow-open-tts-settings`
+- `allow-install-tts-data-if-supported`
+- `allow-list-voices`
 
 ## Permission Table
 
@@ -14,6 +18,84 @@ Default permissions for the plugin
 <th>Description</th>
 </tr>
 
+
+<tr>
+<td>
+
+`tts:allow-install-tts-data-if-supported`
+
+</td>
+<td>
+
+Enables the install_tts_data_if_supported command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:deny-install-tts-data-if-supported`
+
+</td>
+<td>
+
+Denies the install_tts_data_if_supported command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:allow-list-voices`
+
+</td>
+<td>
+
+Enables the list_voices command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:deny-list-voices`
+
+</td>
+<td>
+
+Denies the list_voices command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:allow-open-tts-settings`
+
+</td>
+<td>
+
+Enables the open_tts_settings command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:deny-open-tts-settings`
+
+</td>
+<td>
+
+Denies the open_tts_settings command without any pre-configured scope.
+
+</td>
+</tr>
 
 <tr>
 <td>

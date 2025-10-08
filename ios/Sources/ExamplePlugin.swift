@@ -33,43 +33,21 @@ private func mapWebRateToAVRate(_ web: Double) -> Float {
 // -----------------------------------------------------------------------------
 // Args (Decodable). Accept both "voiceId" and "voice_id" for robustness.
 // -----------------------------------------------------------------------------
-final class SpeakArgs: Decodable {
+class SpeakArgs: Decodable {
     let text: String
     let language: String?
-    let voiceId: String?
+    let voiceIdentifier: String?
     let rate: Double?
     let pitch: Double?
     let volume: Double?
 
-    private enum CodingKeys: String, CodingKey {
-        case text, language, voiceId, voice_id, rate, pitch, volume
-    }
-
-    init(
-        text: String, language: String?, voiceId: String?, rate: Double?, pitch: Double?,
-        volume: Double?
-    ) {
-        self.text = text
-        self.language = language
-        self.voiceId = voiceId
-        self.rate = rate
-        self.pitch = pitch
-        self.volume = volume
-    }
-
-    convenience init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let text = try c.decode(String.self, forKey: .text)
-        let language = try c.decodeIfPresent(String.self, forKey: .language)
-        let voiceId =
-            try c.decodeIfPresent(String.self, forKey: .voiceId)
-            ?? c.decodeIfPresent(String.self, forKey: .voice_id)
-        let rate = try c.decodeIfPresent(Double.self, forKey: .rate)
-        let pitch = try c.decodeIfPresent(Double.self, forKey: .pitch)
-        let volume = try c.decodeIfPresent(Double.self, forKey: .volume)
-        self.init(
-            text: text, language: language, voiceId: voiceId, rate: rate, pitch: pitch,
-            volume: volume)
+    enum CodingKeys: String, CodingKey {
+        case text
+        case language
+        case voiceIdentifier = "voiceId"  // <-- map camelCase JSON key
+        case rate
+        case pitch
+        case volume
     }
 }
 

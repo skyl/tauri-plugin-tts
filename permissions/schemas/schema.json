@@ -295,6 +295,42 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Enables the install_tts_data_if_supported command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-tts-data-if-supported",
+          "markdownDescription": "Enables the install_tts_data_if_supported command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_tts_data_if_supported command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-tts-data-if-supported",
+          "markdownDescription": "Denies the install_tts_data_if_supported command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_voices command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-voices",
+          "markdownDescription": "Enables the list_voices command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_voices command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-voices",
+          "markdownDescription": "Denies the list_voices command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_tts_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-tts-settings",
+          "markdownDescription": "Enables the open_tts_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_tts_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-tts-settings",
+          "markdownDescription": "Denies the open_tts_settings command without any pre-configured scope."
+        },
+        {
           "description": "Enables the ping command without any pre-configured scope.",
           "type": "string",
           "const": "allow-ping",
@@ -331,10 +367,10 @@
           "markdownDescription": "Denies the stop command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-ping`",
+          "description": "Default permissions for the TTS plugin\n#### This default permission set includes:\n\n- `allow-speak`\n- `allow-stop`\n- `allow-open-tts-settings`\n- `allow-install-tts-data-if-supported`\n- `allow-list-voices`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-ping`"
+          "markdownDescription": "Default permissions for the TTS plugin\n#### This default permission set includes:\n\n- `allow-speak`\n- `allow-stop`\n- `allow-open-tts-settings`\n- `allow-install-tts-data-if-supported`\n- `allow-list-voices`"
         }
       ]
     }

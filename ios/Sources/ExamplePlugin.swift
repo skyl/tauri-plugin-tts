@@ -31,23 +31,19 @@ private func mapWebRateToAVRate(_ web: Double) -> Float {
 }
 
 // -----------------------------------------------------------------------------
-// Args (Decodable). Accept both "voiceId" and "voice_id" for robustness.
+// Args (Decodable). **Standardized**: only "voice_id" is accepted.
 // -----------------------------------------------------------------------------
-class SpeakArgs: Decodable {
+final class SpeakArgs: Decodable {
     let text: String
     let language: String?
-    let voiceIdentifier: String?
+    let voiceId: String?
     let rate: Double?
     let pitch: Double?
     let volume: Double?
 
-    enum CodingKeys: String, CodingKey {
-        case text
-        case language
-        case voiceIdentifier = "voiceId"  // <-- map camelCase JSON key
-        case rate
-        case pitch
-        case volume
+    private enum CodingKeys: String, CodingKey {
+        case text, language, rate, pitch, volume
+        case voiceId = "voice_id"  // canonical key from JS/Rust
     }
 }
 
@@ -213,7 +209,8 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
                 "| id:", args.voiceId ?? "nil",
                 "| rate:", args.rate ?? -1,
                 "| pitch:", args.pitch ?? -1,
-                "| volume:", args.volume ?? -1)
+                "| volume:", args.volume ?? -1
+            )
 
             self.prepareAudioSessionIfNeeded()
 
@@ -298,7 +295,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
             ]
         }
         ttsLog("TTS catalog |", Speaker.voicesSummaryLine(all))
-        // IMPORTANT: Tauri iOS wants a JsonObject/JsonValue. Wrap the array in an object.
+        // IMPORTANT: Tauri iOS expects a JsonObject/JsonValue. Wrap the array in an object.
         invoke.resolve(["voices": payload])
     }
 }
@@ -306,7 +303,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
 // -----------------------------------------------------------------------------
 // Tauri Plugin surface (names must match run_mobile_plugin calls from Rust)
 // -----------------------------------------------------------------------------
-class TTSPlugin: Plugin {
+final class TTSPlugin: Plugin {
     private static let speaker = Speaker()
 
     @objc public func speak(_ invoke: Invoke) throws {

@@ -15,17 +15,17 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.ln
 
-// --------------------------- Rate mapping ---------------------------
+/* -------------------------------------------------------------------------- */
+/*                           Rate mapping (web → Android)                     */
+/* -------------------------------------------------------------------------- */
 
-/**
- * Map Corpán's web-style rate (≈0.1–1.5, with 1.0 = "normal") to Android's engine-relative rate.
- * We use a gentle log scale and cap to ~2.5–3.0x for the fast end (engine-dependent).
- */
 private fun mapWebRateToAndroid(
   webRate: Float,
   targetMax: Float = 3.0f
@@ -46,27 +46,29 @@ private fun mapWebRateToAndroid(
   if (abs(w - W_DEF) < 1e-6f) return A_DEF
 
   return if (w < W_DEF) {
-    // [0.1..1.0) → [lo..A_DEF] (log scale)
     val progress = (ln((w / W_MIN).toDouble()) / ln((W_DEF / W_MIN).toDouble())).toFloat()
     lo + progress * (A_DEF - lo)
   } else {
-    // (1.0..1.5] → [A_DEF..hi] (log scale)
     val progress = (ln((w / W_DEF).toDouble()) / ln((W_MAX / W_DEF).toDouble())).toFloat()
     A_DEF + progress * (hi - A_DEF)
   }
 }
 
-// --------------------------- Invoke args ---------------------------
+/* -------------------------------------------------------------------------- */
+/*                                   Args                                     */
+/* -------------------------------------------------------------------------- */
 
 @InvokeArg
 internal class SpeakArgs {
   lateinit var text: String
-  var language: String? = null    // BCP-47 (e.g., "fa-IR")
+  var language: String? = null    // BCP-47, e.g. "fa-IR"
   var rate: Float? = null         // 0.1–1.5
-  var voiceId: String? = null     // Voice.getName()
+  var voiceId: String? = null     // Voice.name
 }
 
-// --------------------------- Plugin ---------------------------
+/* -------------------------------------------------------------------------- */
+/*                                   Plugin                                   */
+/* -------------------------------------------------------------------------- */
 
 @TauriPlugin
 class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
@@ -85,7 +87,6 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
       isInitialized = (status == TextToSpeech.SUCCESS)
       val event = JSObject()
       if (isInitialized) {
-        // Leave engine default language as-is; we pick per-utterance
         event.put("initialized", true)
         trigger("ttsInitialized", event)
         drainPending()
@@ -111,7 +112,7 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
     actions.forEach { it.invoke() }
   }
 
-  // --------------------------- Helpers ---------------------------
+  /* ------------------------------- Helpers -------------------------------- */
 
   private fun baseLang(tag: String?): String? {
     if (tag.isNullOrBlank()) return null
@@ -133,35 +134,29 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   private fun chooseBestVoiceForLanguage(tts: TextToSpeech, langTag: String): Voice? {
+    if (Build.VERSION.SDK_INT < 21) return null
     val voices = tts.voices ?: return null
-
-    // Prefer: locale match (exact > base), offline (no network), higher quality, lower latency.
     return voices
-      .filter { it != null }
       .sortedWith(
-        compareByDescending<Voice> { localeMatches(it, langTag) } // 3/2/0
-          .thenBy { it.isNetworkConnectionRequired }              // false (offline) first
-          .thenByDescending { it.quality }                        // higher is better
-          .thenBy { it.latency }                                  // lower is better
-          .thenBy { it.name }                                     // stable tiebreaker
+        compareByDescending<Voice> { localeMatches(it, langTag) }
+          .thenBy { it.isNetworkConnectionRequired }   // offline first
+          .thenByDescending { it.quality }             // higher better
+          .thenBy { it.latency }                       // lower better
+          .thenBy { it.name }                          // stable tie-breaker
       )
       .firstOrNull()
   }
 
   private fun findVoiceById(tts: TextToSpeech, voiceId: String): Voice? {
+    if (Build.VERSION.SDK_INT < 21) return null
     val voices = tts.voices ?: return null
     return voices.firstOrNull { it.name == voiceId }
   }
 
-  private fun currentEngine(tts: TextToSpeech?): String? {
-    return try {
-      tts?.defaultEngine
-    } catch (_: Throwable) {
-      null
-    }
-  }
+  private fun currentEngine(tts: TextToSpeech?): String? =
+    try { tts?.defaultEngine } catch (_: Throwable) { null }
 
-  // --------------------------- Commands ---------------------------
+  /* ------------------------------- Commands -------------------------------- */
 
   @Command
   fun speak(invoke: Invoke) {
@@ -180,7 +175,6 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
       }
 
       try {
-        // Voice selection (prefer explicit voiceId; otherwise pick best for language)
         val chosenVoice: Voice? = when {
           !args.voiceId.isNullOrBlank() -> findVoiceById(t, args.voiceId!!)
           !args.language.isNullOrBlank() -> chooseBestVoiceForLanguage(t, args.language!!)
@@ -188,7 +182,6 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         if (chosenVoice != null) {
-          // Reject network-only voices for offline-first product
           if (chosenVoice.isNetworkConnectionRequired) {
             invoke.reject("Requested voice requires network: ${chosenVoice.name}")
             return@ensureReady
@@ -208,16 +201,13 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
           }
         }
 
-        // Rate
         val androidRate = mapWebRateToAndroid(args.rate ?: 1.0f, targetMax = 3.0f)
         t.setSpeechRate(androidRate)
 
-        // Speak
         val utteranceId = UUID.randomUUID().toString()
         t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
           override fun onStart(utteranceId: String?) {
-            val event = JSObject()
-            event.put("status", "started")
+            val event = JSObject().apply { put("status", "started") }
             trigger("ttsStatus", event)
           }
 
@@ -225,7 +215,7 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve()
           }
 
-          @Deprecated("Deprecated in Java")
+          @Suppress("DEPRECATION")
           override fun onError(utteranceId: String?) {
             invoke.reject("Speech failed")
           }
@@ -235,7 +225,12 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
           }
         })
 
-        val res = t.speak(args.text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+        val res = if (Build.VERSION.SDK_INT >= 21) {
+          t.speak(args.text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+        } else {
+          @Suppress("DEPRECATION")
+          t.speak(args.text, TextToSpeech.QUEUE_FLUSH, null)
+        }
         if (res == TextToSpeech.ERROR) {
           invoke.reject("Failed to queue speech")
         }
@@ -249,62 +244,46 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
   fun stop(invoke: Invoke) {
     ensureReady {
       tts?.stop()
+      // Optional: also release engine here if you want aggressive cleanup:
+      // tts?.shutdown(); tts = null; isInitialized = false
       invoke.resolve()
     }
   }
 
-  /**
-   * Open the system Text-to-Speech settings screen.
-   * Equivalent to launching Settings.ACTION_TTS_SETTINGS.
-   */
   @Command
   fun openTtsSettings(invoke: Invoke) {
     try {
-      val intent = Intent(Settings.ACTION_TTS_SETTINGS)
-      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      val intent = Intent("android.settings.TTS_SETTINGS").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
       activity.startActivity(intent)
-      invoke.resolve()
-    } catch (e: ActivityNotFoundException) {
-      invoke.reject("Unable to open TTS settings")
+      invoke.resolve(JSObject().apply { put("ok", true) })
+    } catch (_: ActivityNotFoundException) {
+      try {
+        val fallback = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        activity.startActivity(fallback)
+        invoke.resolve(JSObject().apply { put("ok", true) })
+      } catch (_: Exception) {
+        invoke.reject("Unable to open TTS or Accessibility settings")
+      }
     } catch (e: Exception) {
       invoke.reject("Failed to open TTS settings: ${e.message}")
     }
   }
 
-  /**
-   * Best-effort request to install TTS voice data from the active engine.
-   * Returns true if an activity was launched; false otherwise.
-   */
   @Command
   fun installTtsDataIfSupported(invoke: Invoke) {
     try {
       val intent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
-
-      // Direct request to current engine package if known (improves success rate)
-      currentEngine(tts)?.let { intent.`package` = it }
-
+      currentEngine(tts)?.let { pkg -> intent.`package` = pkg }
       intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
       activity.startActivity(intent)
-      invoke.resolve(true)
+      invoke.resolve(JSObject().apply { put("launched", true) })
     } catch (_: ActivityNotFoundException) {
-      invoke.resolve(false)
+      invoke.resolve(JSObject().apply { put("launched", false) })
     } catch (_: Exception) {
-      invoke.resolve(false)
+      invoke.resolve(JSObject().apply { put("launched", false) })
     }
   }
 
-  /**
-   * Return a JSON array of offline-capable voices available from the current engine.
-   * Each item matches the Rust `VoiceInfo` model:
-   * { id, name, language, gender, quality, engine }
-   *
-   * - id: Voice.getName()
-   * - name: null (Android doesn't expose a friendly display name)
-   * - language: Locale#toLanguageTag()
-   * - gender: "unspecified"
-   * - quality: one of "very_low"|"low"|"normal"|"high"|"very_high"
-   * - engine: current engine package
-   */
   @Command
   fun listVoices(invoke: Invoke) {
     ensureReady {
@@ -314,63 +293,55 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
         return@ensureReady
       }
 
+      val arr = JSONArray()
       val engine = currentEngine(t)
-      val voices = t.voices ?: emptySet()
 
-      val payload = mutableListOf<JSObject>()
+      if (Build.VERSION.SDK_INT >= 21) {
+        val voices = t.voices ?: emptySet()
+        val items = voices
+          .filter { !it.isNetworkConnectionRequired }
+          .sortedWith(
+            compareBy<Voice> { it.locale?.toLanguageTag() ?: "" }
+              .thenByDescending { it.quality }
+              .thenBy { it.latency }
+              .thenBy { it.name }
+          )
 
-      for (v in voices) {
-        // Filter out network-only voices; Corpán is offline-first
-        if (v.isNetworkConnectionRequired) continue
-
-        val obj = JSObject()
-        obj.put("id", v.name) // stable ID per engine
-        obj.put("name", null) // Android doesn't expose a friendly label
-        obj.put("language", v.locale?.toLanguageTag() ?: Locale.getDefault().toLanguageTag())
-        obj.put("gender", "unspecified")
-        obj.put("quality", when (v.quality) {
-          Voice.QUALITY_VERY_HIGH -> "very_high"
-          Voice.QUALITY_HIGH -> "high"
-          Voice.QUALITY_NORMAL -> "normal"
-          Voice.QUALITY_LOW -> "low"
-          Voice.QUALITY_VERY_LOW -> "very_low"
-          else -> "normal"
-        })
-        obj.put("engine", engine)
-        payload.add(obj)
+        for (v in items) {
+          val o = JSObject()
+          o.put("id", v.name)
+          o.put("name", JSONObject.NULL) // Android exposes no friendly label
+          o.put("language", v.locale?.toLanguageTag() ?: Locale.getDefault().toLanguageTag())
+          if (engine == null) o.put("engine", JSONObject.NULL) else o.put("engine", engine)
+          o.put("gender", JSONObject.NULL) // not exposed
+          o.put(
+            "quality",
+            when (v.quality) {
+              Voice.QUALITY_VERY_HIGH -> "very_high"
+              Voice.QUALITY_HIGH -> "high"
+              Voice.QUALITY_NORMAL -> "normal"
+              Voice.QUALITY_LOW -> "low"
+              Voice.QUALITY_VERY_LOW -> "very_low"
+              else -> "normal"
+            }
+          )
+          arr.put(o)
+        }
+      } else {
+        val o = JSObject()
+        o.put("id", "default")
+        o.put("name", JSONObject.NULL)
+        o.put("language", Locale.getDefault().toLanguageTag())
+        if (engine == null) o.put("engine", JSONObject.NULL) else o.put("engine", engine)
+        o.put("gender", JSONObject.NULL)
+        o.put("quality", "normal")
+        arr.put(o)
       }
 
-      // Sort for nicer UX: language, quality desc, latency asc, id
-      payload.sortWith(
-        compareBy<JSObject> { it.getString("language") }
-          .thenByDescending {
-            when (it.getString("quality")) {
-              "very_high" -> 5
-              "high" -> 4
-              "normal" -> 3
-              "low" -> 2
-              "very_low" -> 1
-              else -> 3
-            }
-          }
-          .thenBy { it.getString("id") }
-      )
-
-      // Return as a top-level JSON array (Vec<VoiceInfo> on the Rust side)
-      invoke.resolve(payload)
-    }
-  }
-
-  // Clean up
-  override fun destroy() {
-    try {
-      tts?.stop()
-      tts?.shutdown()
-    } finally {
-      tts = null
-      isInitialized = false
-      pendingActions.clear()
-      super.destroy()
+      // If your Rust expects a raw Vec<VoiceInfo>, return `arr` directly:
+      // invoke.resolve(arr)
+      val result = JSObject().apply { put("voices", arr) }
+      invoke.resolve(result)
     }
   }
 }

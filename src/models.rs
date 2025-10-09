@@ -28,15 +28,14 @@ pub struct VoiceInfo {
     pub quality: Option<String>,
 }
 
-/// Arguments for the `speak` command.
-/// We keep this as a single struct so serde can reliably map casing.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeakArgs {
     pub text: String,
     pub language: Option<String>,
     pub rate: Option<f32>,
-    /// Platform-specific voice identifier.
-    /// JSON key is `voiceId` (camelCase) across all platforms.
+    // Accept either "voice_id" (from callers) or "voiceId" (canonical),
+    // and serialize *as* "voiceId" when forwarding to iOS.
+    #[serde(rename = "voiceId", alias = "voice_id")]
     pub voice_id: Option<String>,
 }

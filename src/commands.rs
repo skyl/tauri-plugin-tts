@@ -78,26 +78,8 @@ pub(crate) async fn list_voices<R: Runtime>(app: AppHandle<R>) -> Result<Vec<Voi
     match &r {
         Ok(list) => {
             println!("[NATIVE_TTS:DEBUG] voices.len = {}", list.len());
-            for (i, v) in list.iter().enumerate() {
-                println!(
-                    concat!(
-                        // "  [{}]\n",
-                        // "    id:       {:?}\n",
-                        // "    name:     {:?}\n",
-                        "    language: {:?}\n",
-                        // "    quality:  {:?}\n",
-                        // "    engine:   {:?}\n",
-                        // "    gender:   {:?}\n"
-                    ),
-                    // i, v.id, v.name, v.language, v.quality, v.engine, v.gender
-                    v.language
-                );
-            }
-            // if let Ok(json) = serde_json::to_string_pretty(list) {
-            //     println!("[NATIVE_TTS:DEBUG] voices (json):\n{}", json);
-            // }
         }
-        Err(e) => eprintln!("[NATIVE_TTS:ERROR] list_voices failed: {:?}", e),
+        Err(e) => println!("[NATIVE_TTS:ERROR] list_voices failed: {:?}", e),
     }
 
     r

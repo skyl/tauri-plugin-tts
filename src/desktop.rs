@@ -180,8 +180,11 @@ mod macos_impl {
         Some("normal".to_string())
     }
 
-    fn is_legacy(ident: &str) -> bool {
-        ident.starts_with("com.apple.speech.synthesis.voice.")
+    fn is_blocked_vendor(ident: &str) -> bool {
+        // Filter anything from the old AppKit catalog and Eloquence
+        ident.starts_with("com.apple.speech.")
+            || ident.starts_with("com.apple.eloquence.")
+            || ident.starts_with("com.apple.ttsbundle.")
     }
 
     fn is_novelty(name: &str, ident: &str) -> bool {
@@ -227,7 +230,7 @@ mod macos_impl {
                 let ident = nsstring_to_rust(id_ns);
                 let lang = nsstring_to_rust(lang_ns);
 
-                if is_legacy(&ident) || is_novelty(&name, &ident) {
+                if is_blocked_vendor(&ident) || is_novelty(&name, &ident) {
                     continue;
                 }
 

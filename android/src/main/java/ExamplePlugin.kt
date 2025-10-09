@@ -28,7 +28,7 @@ import kotlin.math.ln
 
 private fun mapWebRateToAndroid(
   webRate: Float,
-  targetMax: Float = 3.0f
+  targetMax: Float = 1.45f // was 3.0f; lower cap so 1.5 web ≈ ~1.42x engine
 ): Float {
   val W_MIN = 0.10f
   val W_DEF = 1.00f
@@ -43,14 +43,17 @@ private fun mapWebRateToAndroid(
   val hi = A_MAX - pad
 
   val w = webRate.coerceIn(W_MIN, W_MAX)
-  if (abs(w - W_DEF) < 1e-6f) return A_DEF
+  if (kotlin.math.abs(w - W_DEF) < 1e-6f) return A_DEF
 
   return if (w < W_DEF) {
-    val progress = (ln((w / W_MIN).toDouble()) / ln((W_DEF / W_MIN).toDouble())).toFloat()
-    lo + progress * (A_DEF - lo)
+    // keep the “slow” curve the same (gentle log)
+    val t = (ln((w / W_MIN).toDouble()) / ln((W_DEF / W_MIN).toDouble())).toFloat()
+    lo + t * (A_DEF - lo)
   } else {
-    val progress = (ln((w / W_DEF).toDouble()) / ln((W_MAX / W_DEF).toDouble())).toFloat()
-    A_DEF + progress * (hi - A_DEF)
+    // stronger compression on the fast side: cubic ease
+    var t = (ln((w / W_DEF).toDouble()) / ln((W_MAX / W_DEF).toDouble())).toFloat()
+    t *= t * t // cubic easing (t^3)
+    A_DEF + t * (hi - A_DEF)
   }
 }
 

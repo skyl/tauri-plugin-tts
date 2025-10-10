@@ -88,6 +88,7 @@ mod macos_impl {
     use cocoa::base::id;
     use cocoa::foundation::NSString; // brings init_str trait into scope
     use objc::{class, msg_send, sel, sel_impl};
+    use std::collections::HashMap;
     use std::ffi::CStr;
 
     // tiny helper for NSString literals
@@ -181,7 +182,7 @@ mod macos_impl {
     }
 
     fn is_blocked_vendor(ident: &str) -> bool {
-        // Filter anything from the old AppKit catalog and Eloquence
+        // Filter anything from the old AppKit catalog, Eloquence, or TTS bundles
         ident.starts_with("com.apple.speech.")
             || ident.starts_with("com.apple.eloquence.")
             || ident.starts_with("com.apple.ttsbundle.")
@@ -212,11 +213,38 @@ mod macos_impl {
         novelty.iter().any(|t| blob.contains(t))
     }
 
+    fn base_key_from_ident(ident: &str) -> String {
+        const PFX: &str = "com.apple.voice.";
+        if let Some(rest) = ident.strip_prefix(PFX) {
+            // Drop any quality token wherever it appears after the prefix.
+            let mut parts: Vec<&str> = rest.split('.').collect();
+            parts.retain(|p| *p != "compact" && *p != "enhanced" && *p != "premium");
+            return format!("{}{}", PFX, parts.join("."));
+        }
+        ident.to_string()
+    }
+
+    /// Premium(3) > Enhanced(2) > Default/Compact(1).
+    /// Prefer explicit tier in the identifier; fall back to AV quality.
+    fn quality_rank(ident: &str, av_q: i64) -> i32 {
+        let id = ident.to_ascii_lowercase();
+        if id.contains(".premium.") {
+            3
+        } else if id.contains(".enhanced.") || av_q >= 2 {
+            2
+        } else {
+            1
+        }
+    }
+
     pub(super) fn macos_list_voices() -> Vec<VoiceInfo> {
         unsafe {
             let voices: id = msg_send![class!(AVSpeechSynthesisVoice), speechVoices];
             let count: usize = msg_send![voices, count];
-            let mut out = Vec::with_capacity(count);
+
+            // Best per base key
+            let mut best: HashMap<String, (VoiceInfo, i32, i64, String)> = HashMap::new();
+            // tuple = (voice, rank, av_quality, ident) for tie-breaks
 
             for idx in 0..count {
                 let v: id = msg_send![voices, objectAtIndex: idx];
@@ -224,27 +252,76 @@ mod macos_impl {
                 let name_ns: id = msg_send![v, name];
                 let id_ns: id = msg_send![v, identifier];
                 let lang_ns: id = msg_send![v, language];
-                let quality: i64 = msg_send![v, quality];
+                let av_q: i64 = msg_send![v, quality];
 
                 let name = nsstring_to_rust(name_ns);
                 let ident = nsstring_to_rust(id_ns);
                 let lang = nsstring_to_rust(lang_ns);
 
+                // Filter legacy/Eloquence/novelty
                 if is_blocked_vendor(&ident) || is_novelty(&name, &ident) {
                     continue;
                 }
 
-                let quality_bucket = quality_bucket(&name, &ident, quality);
+                // Optional gender (macOS 10.15+)
+                let gender_opt = {
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    {
+                        let g: i64 = msg_send![v, gender];
+                        match g {
+                            1 => Some("male".to_string()),
+                            2 => Some("female".to_string()),
+                            _ => Some("unspecified".to_string()),
+                        }
+                    }
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                    {
+                        None
+                    }
+                };
 
-                out.push(VoiceInfo {
-                    id: ident,
-                    name: Some(name),
-                    language: lang,
+                let rank = quality_rank(&ident, av_q);
+                let key = base_key_from_ident(&ident);
+
+                let vi = VoiceInfo {
+                    id: ident.clone(),
+                    name: Some(name.clone()),
+                    language: lang.clone(),
                     engine: Some("Apple TTS".to_string()),
-                    gender: None, // AVFoundation does not expose gender reliably
-                    quality: quality_bucket,
-                });
+                    gender: gender_opt,
+                    quality: quality_bucket(&name, &ident, av_q),
+                };
+
+                match best.get_mut(&key) {
+                    None => {
+                        best.insert(key, (vi, rank, av_q, ident));
+                    }
+                    Some((cur_vi, cur_rank, cur_avq, cur_ident)) => {
+                        let better = (rank > *cur_rank)
+                            || (rank == *cur_rank && av_q > *cur_avq)
+                            || (rank == *cur_rank && av_q == *cur_avq && ident > *cur_ident);
+                        if better {
+                            *cur_vi = vi;
+                            *cur_rank = rank;
+                            *cur_avq = av_q;
+                            *cur_ident = ident;
+                        }
+                    }
+                }
             }
+
+            let mut out: Vec<VoiceInfo> = best.into_values().map(|t| t.0).collect();
+            // Stable UX ordering
+            out.sort_by(|a, b| {
+                (
+                    a.language.to_lowercase(),
+                    a.name.clone().unwrap_or_default().to_lowercase(),
+                )
+                    .cmp(&(
+                        b.language.to_lowercase(),
+                        b.name.clone().unwrap_or_default().to_lowercase(),
+                    ))
+            });
             out
         }
     }
@@ -354,8 +431,6 @@ mod macos_impl {
         }
         Ok(())
     }
-
-    // (no re-exports here; used below)
 }
 
 #[cfg(target_os = "macos")]

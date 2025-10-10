@@ -1,4 +1,5 @@
 import AVFoundation
+import Foundation
 import Tauri
 import os.log
 
@@ -303,9 +304,50 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         return list
     }
 
-    // Replace your existing listVoices(...) with this version.
+    // Replace your existing listVoices(...) with this version (dedup premium>enhanced>compact)
     func listVoices(_ invoke: Invoke) {
-        let list = listableVoices()
+        // 1) Start from modern Apple voices only
+        let all = listableVoices()
+
+        // 2) Build a stable “base key” to collapse compact/enhanced/premium variants
+        //    Use (language + last identifier token) so:
+        //    com.apple.voice.compact.es-ES.Monica / ...enhanced.es-ES.Monica → same key.
+        func baseKey(_ v: AVSpeechSynthesisVoice) -> String {
+            let lastToken = v.identifier.split(separator: ".").last.map(String.init) ?? v.name
+            return "\(v.language.lowercased())|\(lastToken.lowercased())"
+        }
+
+        // 3) Pick the best quality per base key
+        var best: [String: AVSpeechSynthesisVoice] = [:]
+        for v in all {
+            let k = baseKey(v)
+            if let cur = best[k] {
+                let rNew = qualityTier(v)  // premium 3 > enhanced 2 > default 1
+                let rCur = qualityTier(cur)
+                if rNew > rCur
+                    || (rNew == rCur && v.quality.rawValue > cur.quality.rawValue)
+                    || (rNew == rCur && v.quality.rawValue == cur.quality.rawValue
+                        && v.name.localizedCaseInsensitiveCompare(cur.name) == .orderedAscending)
+                {
+                    best[k] = v
+                }
+            } else {
+                best[k] = v
+            }
+        }
+
+        // 4) Deterministic order (lang, then name)
+        let list = best.values.sorted {
+            if $0.language != $1.language {
+                return $0.language.localizedCaseInsensitiveCompare($1.language) == .orderedAscending
+            }
+            if $0.name != $1.name {
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+            return $0.identifier < $1.identifier
+        }
+
+        // 5) Shape payload
         let payload: [[String: Any?]] = list.map { v in
             let genderStr: String? = {
                 if #available(iOS 13.0, macOS 10.15, *) {
@@ -325,11 +367,11 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
                 "name": v.name,
                 "language": v.language,
                 "gender": genderStr as Any?,
-                "quality": qualityString(v),  // premium/enhanced/default mapping preserved
+                "quality": qualityString(v),  // "premium" | "enhanced" | "default"
                 "engine": nil,
             ]
         }
-        // ttsLog("TTS catalog(listable) |", Speaker.voicesSummaryLine(list))
+
         invoke.resolve(["voices": payload])  // Tauri iOS expects an object wrapper
     }
 
@@ -360,91 +402,103 @@ final class TTSPlugin: Plugin {
         Self.speaker.listVoices(invoke)
     }
 
-    // Open device TTS settings (deepest-first candidates)
+    // ---- iOS app on macOS: open macOS System Settings via ObjC runtime (no AppKit) ----
+    @inline(__always)
+    private func openMacSystemSettingsForTTS_viaRuntime() -> Bool {
+        guard #available(iOS 14.0, *), ProcessInfo.processInfo.isiOSAppOnMac else { return false }
+
+        let targets = [
+            "x-apple.systempreferences:com.apple.preference.universalaccess?SpokenContent",
+            "x-apple.systempreferences:com.apple.preference.universalaccess?Hearing_SpokenContent",
+            "x-apple.systempreferences:com.apple.preference.universalaccess?Hearing",
+            "x-apple.systempreferences:com.apple.preference.universalaccess",
+            "x-apple.systempreferences:com.apple.preference.speech?TTS",
+            "x-apple.systempreferences:com.apple.preference.speech",
+        ]
+
+        guard let wsClass: AnyObject = NSClassFromString("NSWorkspace"),
+            let shared = (wsClass as AnyObject)
+                .perform(NSSelectorFromString("sharedWorkspace"))?
+                .takeUnretainedValue()
+        else { return false }
+
+        let openSel = NSSelectorFromString("openURL:")
+        for s in targets {
+            if let u = URL(string: s) {
+                _ = (shared as AnyObject).perform(openSel, with: u as NSURL)
+                return true
+            }
+        }
+        return false
+    }
+
+    // ---- Device Settings deep links (Accessibility ▸ Spoken Content ▸ Voices; older Speech paths) ----
+    @inline(__always)
+    private func iosTTSSettingsURLs() -> [URL] {
+        let schemesNew = [
+            // iOS 15+ Spoken Content
+            "App-Prefs:root=ACCESSIBILITY&path=SPOKEN_CONTENT/VOICES",
+            "App-Prefs:root=ACCESSIBILITY&path=SPOKEN_CONTENT",
+            // Some devices still resolve via General/Accessibility/Speech
+            "App-Prefs:root=General&path=ACCESSIBILITY/SPEECH/VOICES",
+            "App-Prefs:root=General&path=ACCESSIBILITY/SPEECH",
+            "App-Prefs:root=ACCESSIBILITY",
+
+            // Legacy scheme variants
+            "prefs:root=ACCESSIBILITY&path=SPOKEN_CONTENT/VOICES",
+            "prefs:root=ACCESSIBILITY&path=SPOKEN_CONTENT",
+            "prefs:root=General&path=ACCESSIBILITY/SPEECH/VOICES",
+            "prefs:root=General&path=ACCESSIBILITY/SPEECH",
+            "prefs:root=ACCESSIBILITY",
+        ]
+
+        let schemesOld = [
+            // iOS 14 and earlier Speech paths first
+            "App-Prefs:root=General&path=ACCESSIBILITY/SPEECH/VOICES",
+            "App-Prefs:root=General&path=ACCESSIBILITY/SPEECH",
+            "App-Prefs:root=ACCESSIBILITY",
+
+            // Legacy scheme variants
+            "prefs:root=General&path=ACCESSIBILITY/SPEECH/VOICES",
+            "prefs:root=General&path=ACCESSIBILITY/SPEECH",
+            "prefs:root=ACCESSIBILITY",
+        ]
+
+        if #available(iOS 15.0, *) {
+            return schemesNew.compactMap(URL.init(string:))
+        } else {
+            return schemesOld.compactMap(URL.init(string:))
+        }
+    }
+
+    // ---- Public entry point: try macOS → device Settings deeplinks → app Settings (last) ----
     @objc public func openTtsSettings(_ invoke: Invoke) {
         #if canImport(UIKit)
-            // iOS: make sure Info.plist has LSApplicationQueriesSchemes = ["App-Prefs", "prefs" (optional)]
-            let candidates: [URL] = {
-                if #available(iOS 15.0, *) {
-                    return [
-                        // iOS 15+ Spoken Content → Voices
-                        URL(string: "App-Prefs:root=ACCESSIBILITY&path=SPOKEN_CONTENT/VOICES"),
-                        URL(string: "App-Prefs:root=ACCESSIBILITY&path=SPOKEN_CONTENT"),
+            // 1) iOS app running on macOS (not Catalyst): open macOS System Settings
+            if openMacSystemSettingsForTTS_viaRuntime() {
+                invoke.resolve()
+                return
+            }
 
-                        // Related toggles (land near Spoken Content)
-                        URL(string: "App-Prefs:root=ACCESSIBILITY&path=SPEAK_SCREEN"),
-                        URL(string: "App-Prefs:root=ACCESSIBILITY&path=SPEAK_SELECTION"),
-
-                        // Pane-level fallbacks
-                        URL(string: "App-Prefs:root=ACCESSIBILITY"),
-                        URL(string: "App-Prefs:root=General&path=ACCESSIBILITY"),
-
-                        // Legacy scheme (only if you also add "prefs" to LSApplicationQueriesSchemes)
-                        URL(string: "prefs:root=ACCESSIBILITY&path=SPOKEN_CONTENT/VOICES"),
-                        URL(string: "prefs:root=ACCESSIBILITY&path=SPOKEN_CONTENT"),
-                        URL(string: "prefs:root=ACCESSIBILITY&path=SPEECH"),
-                        URL(string: "prefs:root=General&path=ACCESSIBILITY/SPEECH"),
-                        URL(string: "prefs:root=ACCESSIBILITY"),
-                    ].compactMap { $0 }
-                } else {
-                    // iOS < 15: fall back to older Speech entries first
-                    return [
-                        URL(string: "App-Prefs:root=ACCESSIBILITY&path=SPEECH"),
-                        URL(string: "App-Prefs:root=General&path=ACCESSIBILITY/SPEECH"),
-                        URL(string: "App-Prefs:root=ACCESSIBILITY"),
-
-                        // Legacy "prefs:" variants
-                        URL(string: "prefs:root=ACCESSIBILITY&path=SPEECH"),
-                        URL(string: "prefs:root=General&path=ACCESSIBILITY/SPEECH"),
-                        URL(string: "prefs:root=ACCESSIBILITY"),
-                    ].compactMap { $0 }
-                }
-            }()
-
-            for url in candidates {
+            // 2) iPhone/iPad: try device Settings deep links (Accessibility ▸ Spoken Content ▸ Voices)
+            for url in iosTTSSettingsURLs() {
                 if UIApplication.shared.canOpenURL(url) {
-                    // ttsLog("TTS settings | opening:", url.absoluteString)
                     UIApplication.shared.open(url, options: [:]) { _ in invoke.resolve() }
                     return
                 }
             }
-            // ttsLog("TTS settings | no deep link available (check LSApplicationQueriesSchemes)")
-            invoke.resolve()
 
-        #elseif canImport(AppKit)
-            let candidates: [URL] = [
-                // macOS Ventura+ (System Settings)
-                URL(
-                    string:
-                        "x-apple.systempreferences:com.apple.preference.universalaccess?SpokenContent"
-                ),
-                // Some builds anchor via a group key
-                URL(
-                    string:
-                        "x-apple.systempreferences:com.apple.preference.universalaccess?Hearing_SpokenContent"
-                ),
-                URL(
-                    string: "x-apple.systempreferences:com.apple.preference.universalaccess?Hearing"
-                ),
-                // Accessibility pane fallback
-                URL(string: "x-apple.systempreferences:com.apple.preference.universalaccess"),
-                // Older System Preferences → Speech
-                URL(string: "x-apple.systempreferences:com.apple.preference.speech?TTS"),
-                URL(string: "x-apple.systempreferences:com.apple.preference.speech"),
-            ].compactMap { $0 }
-
-            for url in candidates {
-                if NSWorkspace.shared.open(url) {
-                    // ttsLog("TTS settings | opening:", url.absoluteString)
-                    invoke.resolve()
-                    return
-                }
+            // 3) Last resort: open the app’s Settings page (at least lands in Settings)
+            if let appSettings = URL(string: UIApplication.openSettingsURLString),
+                UIApplication.shared.canOpenURL(appSettings)
+            {
+                UIApplication.shared.open(appSettings, options: [:]) { _ in invoke.resolve() }
+                return
             }
-            // ttsLog("TTS settings | failed to open System Settings on macOS")
-            invoke.resolve()
 
+            // 4) If absolutely nothing worked, still resolve so the UI doesn’t hang.
+            invoke.resolve()
         #else
-            // ttsLog("TTS settings | unsupported platform")
             invoke.resolve()
         #endif
     }

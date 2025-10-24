@@ -5,11 +5,11 @@ plugins {
 
 android {
     namespace = "space.httpjames.tauri_plugin_tts"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
-        minSdk = 21
-
+        minSdk = 24
+        targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
     }

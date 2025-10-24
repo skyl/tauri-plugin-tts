@@ -301,8 +301,25 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
 
       if (Build.VERSION.SDK_INT >= 21) {
         val voices = t.voices ?: emptySet()
+
         val items = voices
+          // 1) Offline / no network required
           .filter { !it.isNetworkConnectionRequired }
+          // 2) Exclude voices whose data isn't installed (engine-specific flag)
+          .filter { v ->
+            val feats = v.features ?: emptySet()
+            !feats.contains("notInstalled")
+          }
+          // 3) Keep only languages the engine says are available
+          .filter { v ->
+            val loc = v.locale ?: Locale.getDefault()
+            when (t.isLanguageAvailable(loc)) {
+              TextToSpeech.LANG_AVAILABLE,
+              TextToSpeech.LANG_COUNTRY_AVAILABLE,
+              TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE -> true
+              else -> false
+            }
+          }
           .sortedWith(
             compareBy<Voice> { it.locale?.toLanguageTag() ?: "" }
               .thenByDescending { it.quality }
@@ -347,4 +364,5 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve(result)
     }
   }
+
 }

@@ -3,7 +3,6 @@ package space.httpjames.tauri_plugin_tts
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
-import android.os.Build
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -28,7 +27,7 @@ import kotlin.math.ln
 
 private fun mapWebRateToAndroid(
   webRate: Float,
-  targetMax: Float = 1.45f // was 3.0f; lower cap so 1.5 web ≈ ~1.42x engine
+  targetMax: Float = 1.45f // default: keeps fast side compressed unless you override
 ): Float {
   val W_MIN = 0.10f
   val W_DEF = 1.00f
@@ -43,16 +42,16 @@ private fun mapWebRateToAndroid(
   val hi = A_MAX - pad
 
   val w = webRate.coerceIn(W_MIN, W_MAX)
-  if (kotlin.math.abs(w - W_DEF) < 1e-6f) return A_DEF
+  if (abs(w - W_DEF) < 1e-6f) return A_DEF
 
   return if (w < W_DEF) {
-    // keep the “slow” curve the same (gentle log)
+    // keep the “slow” curve gentle
     val t = (ln((w / W_MIN).toDouble()) / ln((W_DEF / W_MIN).toDouble())).toFloat()
     lo + t * (A_DEF - lo)
   } else {
-    // stronger compression on the fast side: cubic ease
+    // compress fast side harder
     var t = (ln((w / W_DEF).toDouble()) / ln((W_MAX / W_DEF).toDouble())).toFloat()
-    t *= t * t // cubic easing (t^3)
+    t *= t * t // cubic
     A_DEF + t * (hi - A_DEF)
   }
 }
@@ -137,21 +136,20 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   private fun chooseBestVoiceForLanguage(tts: TextToSpeech, langTag: String): Voice? {
-    if (Build.VERSION.SDK_INT < 21) return null
+    // Assumes API 21+ (realistic for your target)
     val voices = tts.voices ?: return null
     return voices
       .sortedWith(
         compareByDescending<Voice> { localeMatches(it, langTag) }
-          .thenBy { it.isNetworkConnectionRequired }   // offline first
-          .thenByDescending { it.quality }             // higher better
-          .thenBy { it.latency }                       // lower better
-          .thenBy { it.name }                          // stable tie-breaker
+          .thenBy { it.isNetworkConnectionRequired }   // offline-first, but don’t reject network
+          .thenByDescending { it.quality }
+          .thenBy { it.latency }
+          .thenBy { it.name }
       )
       .firstOrNull()
   }
 
   private fun findVoiceById(tts: TextToSpeech, voiceId: String): Voice? {
-    if (Build.VERSION.SDK_INT < 21) return null
     val voices = tts.voices ?: return null
     return voices.firstOrNull { it.name == voiceId }
   }
@@ -185,16 +183,10 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         if (chosenVoice != null) {
-          if (chosenVoice.isNetworkConnectionRequired) {
-            invoke.reject("Requested voice requires network: ${chosenVoice.name}")
+          val setOk = t.setVoice(chosenVoice)
+          if (setOk != TextToSpeech.SUCCESS) {
+            invoke.reject("Failed to set voice: ${chosenVoice.name}")
             return@ensureReady
-          }
-          if (Build.VERSION.SDK_INT >= 21) {
-            val setOk = t.setVoice(chosenVoice)
-            if (setOk != TextToSpeech.SUCCESS) {
-              invoke.reject("Failed to set voice: ${chosenVoice.name}")
-              return@ensureReady
-            }
           }
         } else if (!args.language.isNullOrBlank()) {
           val res = t.setLanguage(Locale.forLanguageTag(args.language))
@@ -204,6 +196,7 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
           }
         }
 
+        // You can override targetMax to 3.0f at call site if you want
         val androidRate = mapWebRateToAndroid(args.rate ?: 1.0f, targetMax = 3.0f)
         t.setSpeechRate(androidRate)
 
@@ -228,12 +221,7 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
           }
         })
 
-        val res = if (Build.VERSION.SDK_INT >= 21) {
-          t.speak(args.text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
-        } else {
-          @Suppress("DEPRECATION")
-          t.speak(args.text, TextToSpeech.QUEUE_FLUSH, null)
-        }
+        val res = t.speak(args.text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
         if (res == TextToSpeech.ERROR) {
           invoke.reject("Failed to queue speech")
         }
@@ -247,7 +235,7 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
   fun stop(invoke: Invoke) {
     ensureReady {
       tts?.stop()
-      // Optional: also release engine here if you want aggressive cleanup:
+      // if you ever want aggressive cleanup:
       // tts?.shutdown(); tts = null; isInitialized = false
       invoke.resolve()
     }
@@ -299,70 +287,52 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
       val arr = JSONArray()
       val engine = currentEngine(t)
 
-      if (Build.VERSION.SDK_INT >= 21) {
-        val voices = t.voices ?: emptySet()
+      val voices = t.voices ?: emptySet()
 
-        val items = voices
-          // 1) Offline / no network required
-          .filter { !it.isNetworkConnectionRequired }
-          // 2) Exclude voices whose data isn't installed (engine-specific flag)
-          .filter { v ->
-            val feats = v.features ?: emptySet()
-            !feats.contains("notInstalled")
-          }
-          // 3) Keep only languages the engine says are available
-          .filter { v ->
-            val loc = v.locale ?: Locale.getDefault()
-            when (t.isLanguageAvailable(loc)) {
-              TextToSpeech.LANG_AVAILABLE,
-              TextToSpeech.LANG_COUNTRY_AVAILABLE,
-              TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE -> true
-              else -> false
-            }
-          }
-          .sortedWith(
-            compareBy<Voice> { it.locale?.toLanguageTag() ?: "" }
-              .thenByDescending { it.quality }
-              .thenBy { it.latency }
-              .thenBy { it.name }
-          )
+      val items = voices
+        .sortedWith(
+          compareBy<Voice> { it.locale?.toLanguageTag() ?: "" }
+            .thenByDescending { it.quality }
+            .thenBy { it.latency }
+            .thenBy { it.name }
+        )
 
-        for (v in items) {
-          val o = JSObject()
-          o.put("id", v.name)
-          o.put("name", JSONObject.NULL) // Android exposes no friendly label
-          o.put("language", v.locale?.toLanguageTag() ?: Locale.getDefault().toLanguageTag())
-          if (engine == null) o.put("engine", JSONObject.NULL) else o.put("engine", engine)
-          o.put("gender", JSONObject.NULL) // not exposed
-          o.put(
-            "quality",
-            when (v.quality) {
-              Voice.QUALITY_VERY_HIGH -> "very_high"
-              Voice.QUALITY_HIGH -> "high"
-              Voice.QUALITY_NORMAL -> "normal"
-              Voice.QUALITY_LOW -> "low"
-              Voice.QUALITY_VERY_LOW -> "very_low"
-              else -> "normal"
-            }
-          )
-          arr.put(o)
-        }
-      } else {
+      for (v in items) {
         val o = JSObject()
-        o.put("id", "default")
-        o.put("name", JSONObject.NULL)
-        o.put("language", Locale.getDefault().toLanguageTag())
+        o.put("id", v.name)
+        o.put("name", JSONObject.NULL) // Android exposes no friendly label
+        o.put("language", v.locale?.toLanguageTag() ?: Locale.getDefault().toLanguageTag())
         if (engine == null) o.put("engine", JSONObject.NULL) else o.put("engine", engine)
-        o.put("gender", JSONObject.NULL)
-        o.put("quality", "normal")
+        o.put("gender", JSONObject.NULL) // not exposed
+        o.put(
+          "quality",
+          when (v.quality) {
+            Voice.QUALITY_VERY_HIGH -> "very_high"
+            Voice.QUALITY_HIGH -> "high"
+            Voice.QUALITY_NORMAL -> "normal"
+            Voice.QUALITY_LOW -> "low"
+            Voice.QUALITY_VERY_LOW -> "very_low"
+            else -> "normal"
+          }
+        )
+
+        val feats = v.features ?: emptySet()
+        val nameLc = v.name.lowercase(Locale.ROOT)
+
+        // Generic + Google-friendly heuristic:
+        //  - API signal: isNetworkConnectionRequired / "networkTts" feature
+        //  - Name hint: ids like "xx-YY-network"
+        val networkByApi = v.isNetworkConnectionRequired || feats.contains("networkTts")
+        val networkByName = nameLc.endsWith("-network") || nameLc.contains("network")
+        val networkRequired = networkByApi || networkByName
+
+        o.put("networkRequired", networkRequired)
+
         arr.put(o)
       }
 
-      // If your Rust expects a raw Vec<VoiceInfo>, return `arr` directly:
-      // invoke.resolve(arr)
       val result = JSObject().apply { put("voices", arr) }
       invoke.resolve(result)
     }
   }
-
 }

@@ -57,6 +57,18 @@ final class SpeakArgs: Decodable {
 // -----------------------------------------------------------------------------
 final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
     private static let synth = AVSpeechSynthesizer()
+    private static let cacheQueue = DispatchQueue(label: "com.corpora.tts.voiceCache")
+    private static let cacheTTLSeconds: TimeInterval = 10.0
+
+    private struct VoiceCache {
+        let updatedAt: Date
+        let listable: [AVSpeechSynthesisVoice]
+        let usable: [AVSpeechSynthesisVoice]
+        let usableById: [String: AVSpeechSynthesisVoice]
+        let listPayload: [[String: Any?]]
+    }
+
+    private static var cachedVoices: VoiceCache?
 
     // Known “novelty/legacy” markers to avoid for production TTS
     private static let NOVELTY_TOKENS: [String] = [
@@ -139,7 +151,10 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     private func allUsableVoices() -> [AVSpeechSynthesisVoice] {
-        let all = AVSpeechSynthesisVoice.speechVoices()
+        return getVoiceCache().usable
+    }
+
+    private func buildUsableVoices(from all: [AVSpeechSynthesisVoice]) -> [AVSpeechSynthesisVoice] {
         var keep: [AVSpeechSynthesisVoice] = []
         var droppedLegacy = 0
         var droppedEloq = 0
@@ -163,6 +178,113 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         //     "TTS filter | kept:", keep.count,
         //     "| legacy:", droppedLegacy, "| eloquence:", droppedEloq, "| novelty:", droppedNovelty)
         return keep
+    }
+
+    // Only expose modern Apple Voices in the list (no eloquence / legacy / novelty).
+    private func buildListableVoices(from all: [AVSpeechSynthesisVoice]) -> [AVSpeechSynthesisVoice] {
+        let list = all.filter { $0.identifier.hasPrefix(Self.VOICE_PREFIX) }
+        // ttsLog("TTS list filter | total:", all.count, "| com.apple.voice:*:", list.count)
+        if list.isEmpty {
+            ttsLog(
+                "TTS list filter | WARNING: no com.apple.voice.* voices present on this device/sim."
+            )
+        }
+        return list
+    }
+
+    private func buildListPayload(from listable: [AVSpeechSynthesisVoice]) -> [[String: Any?]] {
+        // 1) Start from modern Apple voices only
+        let all = listable
+
+        // 2) Build a stable “base key” to collapse compact/enhanced/premium variants
+        //    Use (language + last identifier token) so:
+        //    com.apple.voice.compact.es-ES.Monica / ...enhanced.es-ES.Monica → same key.
+        func baseKey(_ v: AVSpeechSynthesisVoice) -> String {
+            let lastToken = v.identifier.split(separator: ".").last.map(String.init) ?? v.name
+            return "\(v.language.lowercased())|\(lastToken.lowercased())"
+        }
+
+        // 3) Pick the best quality per base key
+        var best: [String: AVSpeechSynthesisVoice] = [:]
+        for v in all {
+            let k = baseKey(v)
+            if let cur = best[k] {
+                let rNew = qualityTier(v)  // premium 3 > enhanced 2 > default 1
+                let rCur = qualityTier(cur)
+                if rNew > rCur
+                    || (rNew == rCur && v.quality.rawValue > cur.quality.rawValue)
+                    || (rNew == rCur && v.quality.rawValue == cur.quality.rawValue
+                        && v.name.localizedCaseInsensitiveCompare(cur.name) == .orderedAscending)
+                {
+                    best[k] = v
+                }
+            } else {
+                best[k] = v
+            }
+        }
+
+        // 4) Deterministic order (lang, then name)
+        let list = best.values.sorted {
+            if $0.language != $1.language {
+                return $0.language.localizedCaseInsensitiveCompare($1.language) == .orderedAscending
+            }
+            if $0.name != $1.name {
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+            return $0.identifier < $1.identifier
+        }
+
+        // 5) Shape payload
+        return list.map { v in
+            let genderStr: String? = {
+                if #available(iOS 13.0, macOS 10.15, *) {
+                    switch v.gender {
+                    case .male: return "male"
+                    case .female: return "female"
+                    case .unspecified: return "unspecified"
+                    @unknown default: return "unspecified"
+                    }
+                } else {
+                    return nil
+                }
+            }()
+
+            return [
+                "id": v.identifier,
+                "name": v.name,
+                "language": v.language,
+                "gender": genderStr as Any?,
+                "quality": qualityString(v),  // "premium" | "enhanced" | "default"
+                "engine": nil,
+            ]
+        }
+    }
+
+    private func getVoiceCache(force: Bool = false) -> VoiceCache {
+        return Self.cacheQueue.sync {
+            let now = Date()
+            if !force, let cached = Self.cachedVoices,
+                now.timeIntervalSince(cached.updatedAt) < Self.cacheTTLSeconds
+            {
+                return cached
+            }
+
+            let all = AVSpeechSynthesisVoice.speechVoices()
+            let listable = buildListableVoices(from: all)
+            let usable = buildUsableVoices(from: all)
+            let byId = Dictionary(uniqueKeysWithValues: usable.map { ($0.identifier, $0) })
+            let payload = buildListPayload(from: listable)
+
+            let fresh = VoiceCache(
+                updatedAt: now,
+                listable: listable,
+                usable: usable,
+                usableById: byId,
+                listPayload: payload
+            )
+            Self.cachedVoices = fresh
+            return fresh
+        }
     }
 
     private func pickBest(in pool: [AVSpeechSynthesisVoice], want: String)
@@ -228,7 +350,8 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     func speak(_ args: SpeakArgs, invoke: Invoke) {
-        DispatchQueue.main.async {
+        // Performance optimization: Do voice selection on background queue
+        DispatchQueue.global(qos: .userInitiated).async {
             ttsLog(
                 "TTS speak | lang:", args.language ?? "nil",
                 "| id:", args.voiceId ?? "nil",
@@ -237,45 +360,50 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
                 "| volume:", args.volume ?? -1
             )
 
-            self.prepareAudioSessionIfNeeded()
-
-            // If you want strict single-utterance behavior, uncomment:
-            // if Self.synth.isSpeaking {
-            //     Self.synth.stopSpeaking(at: .immediate)
-            //     ttsLog("TTS synth | stopped previous utterance")
-            // }
-
-            let utter = AVSpeechUtterance(string: args.text)
+            // Voice selection on background thread (performance optimization)
+            var selectedVoice: AVSpeechSynthesisVoice?
 
             // Prefer explicit voice by identifier
-            if let id = args.voiceId,
-                let v = self.allUsableVoices().first(where: { $0.identifier == id })
-            {
-                utter.voice = v
+            if let id = args.voiceId, let v = self.getVoiceCache().usableById[id] {
+                selectedVoice = v
                 ttsLog("TTS voice | using id:", v.name, v.language, v.identifier)
             }
 
             // Otherwise pick by language ranking
-            if utter.voice == nil, let best = self.pickVoice(language: args.language) {
-                utter.voice = best
+            if selectedVoice == nil, let best = self.pickVoice(language: args.language) {
+                selectedVoice = best
                 ttsLog(
                     "TTS voice | picked:", best.name, best.language,
                     "tier:", self.qualityTier(best), "avQ:", best.quality.rawValue)
             }
 
-            // Prosody
-            utter.rate =
-                (args.rate != nil)
-                ? mapWebRateToAVRate(args.rate!) : AVSpeechUtteranceDefaultSpeechRate
-            if let p = args.pitch { utter.pitchMultiplier = Float(p) }
-            if let v = args.volume { utter.volume = Float(v) }
-            // ttsLog(
-            //     "TTS prosody | rate:", utter.rate, "pitch:", utter.pitchMultiplier, "volume:",
-            //     utter.volume)
+            // Only dispatch to main thread for actual synthesis (required by AVFoundation)
+            DispatchQueue.main.async {
+                self.prepareAudioSessionIfNeeded()
 
-            Self.synth.speak(utter)
-            // ttsLog("TTS synth | queued")
-            invoke.resolve()
+                // If you want strict single-utterance behavior, uncomment:
+                // if Self.synth.isSpeaking {
+                //     Self.synth.stopSpeaking(at: .immediate)
+                //     ttsLog("TTS synth | stopped previous utterance")
+                // }
+
+                let utter = AVSpeechUtterance(string: args.text)
+                utter.voice = selectedVoice
+
+                // Prosody
+                utter.rate =
+                    (args.rate != nil)
+                    ? mapWebRateToAVRate(args.rate!) : AVSpeechUtteranceDefaultSpeechRate
+                if let p = args.pitch { utter.pitchMultiplier = Float(p) }
+                if let v = args.volume { utter.volume = Float(v) }
+                // ttsLog(
+                //     "TTS prosody | rate:", utter.rate, "pitch:", utter.pitchMultiplier, "volume:",
+                //     utter.volume)
+
+                Self.synth.speak(utter)
+                // ttsLog("TTS synth | queued")
+                invoke.resolve()
+            }
         }
     }
 
@@ -291,88 +419,14 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         invoke.resolve(Self.synth.isSpeaking)
     }
 
-    // Only expose modern Apple Voices in the list (no eloquence / legacy / novelty).
-    private func listableVoices() -> [AVSpeechSynthesisVoice] {
-        let all = AVSpeechSynthesisVoice.speechVoices()
-        let list = all.filter { $0.identifier.hasPrefix(Self.VOICE_PREFIX) }
-        // ttsLog("TTS list filter | total:", all.count, "| com.apple.voice:*:", list.count)
-        if list.isEmpty {
-            ttsLog(
-                "TTS list filter | WARNING: no com.apple.voice.* voices present on this device/sim."
-            )
-        }
-        return list
-    }
-
     // Replace your existing listVoices(...) with this version (dedup premium>enhanced>compact)
     func listVoices(_ invoke: Invoke) {
-        // 1) Start from modern Apple voices only
-        let all = listableVoices()
-
-        // 2) Build a stable “base key” to collapse compact/enhanced/premium variants
-        //    Use (language + last identifier token) so:
-        //    com.apple.voice.compact.es-ES.Monica / ...enhanced.es-ES.Monica → same key.
-        func baseKey(_ v: AVSpeechSynthesisVoice) -> String {
-            let lastToken = v.identifier.split(separator: ".").last.map(String.init) ?? v.name
-            return "\(v.language.lowercased())|\(lastToken.lowercased())"
-        }
-
-        // 3) Pick the best quality per base key
-        var best: [String: AVSpeechSynthesisVoice] = [:]
-        for v in all {
-            let k = baseKey(v)
-            if let cur = best[k] {
-                let rNew = qualityTier(v)  // premium 3 > enhanced 2 > default 1
-                let rCur = qualityTier(cur)
-                if rNew > rCur
-                    || (rNew == rCur && v.quality.rawValue > cur.quality.rawValue)
-                    || (rNew == rCur && v.quality.rawValue == cur.quality.rawValue
-                        && v.name.localizedCaseInsensitiveCompare(cur.name) == .orderedAscending)
-                {
-                    best[k] = v
-                }
-            } else {
-                best[k] = v
+        DispatchQueue.global(qos: .userInitiated).async {
+            let payload = self.getVoiceCache().listPayload
+            DispatchQueue.main.async {
+                invoke.resolve(["voices": payload])  // Tauri iOS expects an object wrapper
             }
         }
-
-        // 4) Deterministic order (lang, then name)
-        let list = best.values.sorted {
-            if $0.language != $1.language {
-                return $0.language.localizedCaseInsensitiveCompare($1.language) == .orderedAscending
-            }
-            if $0.name != $1.name {
-                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-            }
-            return $0.identifier < $1.identifier
-        }
-
-        // 5) Shape payload
-        let payload: [[String: Any?]] = list.map { v in
-            let genderStr: String? = {
-                if #available(iOS 13.0, macOS 10.15, *) {
-                    switch v.gender {
-                    case .male: return "male"
-                    case .female: return "female"
-                    case .unspecified: return "unspecified"
-                    @unknown default: return "unspecified"
-                    }
-                } else {
-                    return nil
-                }
-            }()
-
-            return [
-                "id": v.identifier,
-                "name": v.name,
-                "language": v.language,
-                "gender": genderStr as Any?,
-                "quality": qualityString(v),  // "premium" | "enhanced" | "default"
-                "engine": nil,
-            ]
-        }
-
-        invoke.resolve(["voices": payload])  // Tauri iOS expects an object wrapper
     }
 
 }

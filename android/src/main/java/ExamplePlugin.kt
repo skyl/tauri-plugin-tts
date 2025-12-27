@@ -79,6 +79,11 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
   private var isInitialized = false
   private val pendingActions = mutableListOf<() -> Unit>()
 
+  // Voice caching for performance (avoid repeated expensive voice enumeration)
+  private var voiceCache: List<Voice>? = null
+  private var voiceCacheTime: Long = 0
+  private val VOICE_CACHE_TTL = 30_000L // 30 seconds like iOS
+
   override fun load(webView: WebView) {
     initializeTTS()
   }
@@ -135,13 +140,30 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
+  // Get cached voices or fetch fresh if cache expired (performance optimization)
+  private fun getCachedVoices(tts: TextToSpeech): List<Voice> {
+    val now = System.currentTimeMillis()
+    if (voiceCache == null || now - voiceCacheTime > VOICE_CACHE_TTL) {
+      voiceCache = tts.voices?.toList()?.filter { voice ->
+        // Filter out low-quality voices
+        voice.quality >= Voice.QUALITY_NORMAL
+      }?.sortedWith(
+        compareByDescending<Voice> { it.quality }
+          .thenBy { it.latency }
+          .thenBy { it.name }
+      ) ?: emptyList()
+      voiceCacheTime = now
+    }
+    return voiceCache ?: emptyList()
+  }
+
   private fun chooseBestVoiceForLanguage(tts: TextToSpeech, langTag: String): Voice? {
-    // Assumes API 21+ (realistic for your target)
-    val voices = tts.voices ?: return null
+    // Use cached voices for performance
+    val voices = getCachedVoices(tts)
     return voices
       .sortedWith(
         compareByDescending<Voice> { localeMatches(it, langTag) }
-          .thenBy { it.isNetworkConnectionRequired }   // offline-first, but don’t reject network
+          .thenBy { it.isNetworkConnectionRequired }   // offline-first, but don't reject network
           .thenByDescending { it.quality }
           .thenBy { it.latency }
           .thenBy { it.name }
@@ -150,7 +172,8 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   private fun findVoiceById(tts: TextToSpeech, voiceId: String): Voice? {
-    val voices = tts.voices ?: return null
+    // Use cached voices for performance
+    val voices = getCachedVoices(tts)
     return voices.firstOrNull { it.name == voiceId }
   }
 
@@ -203,27 +226,45 @@ class ExamplePlugin(private val activity: Activity) : Plugin(activity) {
         val utteranceId = UUID.randomUUID().toString()
         t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
           override fun onStart(utteranceId: String?) {
-            val event = JSObject().apply { put("status", "started") }
+            val event = JSObject().apply {
+              put("status", "started")
+              put("utteranceId", utteranceId ?: JSONObject.NULL)
+            }
             trigger("ttsStatus", event)
           }
 
           override fun onDone(utteranceId: String?) {
-            invoke.resolve()
+            val event = JSObject().apply {
+              put("status", "ended")
+              put("utteranceId", utteranceId ?: JSONObject.NULL)
+            }
+            trigger("ttsStatus", event)
           }
 
           @Suppress("DEPRECATION")
           override fun onError(utteranceId: String?) {
-            invoke.reject("Speech failed")
+            val event = JSObject().apply {
+              put("status", "error")
+              put("utteranceId", utteranceId ?: JSONObject.NULL)
+            }
+            trigger("ttsStatus", event)
           }
 
           override fun onError(utteranceId: String?, errorCode: Int) {
-            invoke.reject("Speech failed: $errorCode")
+            val event = JSObject().apply {
+              put("status", "error")
+              put("utteranceId", utteranceId ?: JSONObject.NULL)
+              put("errorCode", errorCode)
+            }
+            trigger("ttsStatus", event)
           }
         })
 
-        val res = t.speak(args.text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+        val res = t.speak(args.text, TextToSpeech.QUEUE_ADD, null, utteranceId)
         if (res == TextToSpeech.ERROR) {
           invoke.reject("Failed to queue speech")
+        } else {
+          invoke.resolve()
         }
       } catch (e: Exception) {
         invoke.reject(e.message ?: "Unknown error")

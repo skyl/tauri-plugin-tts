@@ -37,7 +37,10 @@ impl<R: Runtime> Tts<R> {
     }
 
     pub fn stop(&self) -> crate::Result<()> {
-        // We create a new synthesizer per call on macOS, so stop is a no-op.
+        #[cfg(target_os = "macos")]
+        {
+            macos_stop()?;
+        }
         Ok(())
     }
 
@@ -90,6 +93,7 @@ mod macos_impl {
     use objc::{class, msg_send, sel, sel_impl};
     use std::collections::HashMap;
     use std::ffi::CStr;
+    use std::sync::{Mutex, Once};
 
     // tiny helper for NSString literals
     #[macro_export]
@@ -97,6 +101,19 @@ mod macos_impl {
         ($s:expr) => {{
             cocoa::foundation::NSString::alloc(cocoa::base::nil).init_str($s)
         }};
+    }
+
+    // Static synthesizer instance for performance (reuse instead of creating new one per call)
+    static SYNTH_INIT: Once = Once::new();
+    static mut SYNTH_INSTANCE: Option<Mutex<id>> = None;
+
+    /// Get or create the shared synthesizer instance
+    unsafe fn get_synthesizer() -> &'static Mutex<id> {
+        SYNTH_INIT.call_once(|| {
+            let synth: id = msg_send![class!(AVSpeechSynthesizer), new];
+            SYNTH_INSTANCE = Some(Mutex::new(synth));
+        });
+        SYNTH_INSTANCE.as_ref().unwrap()
     }
 
     #[inline]
@@ -426,12 +443,24 @@ mod macos_impl {
                 }
             }
 
-            let synth: id = msg_send![class!(AVSpeechSynthesizer), new];
+            // Use the static synthesizer instance (performance optimization)
+            let synth_mutex = get_synthesizer();
+            let synth = *synth_mutex.lock().unwrap();
             let _: () = msg_send![synth, speakUtterance: utter];
+        }
+        Ok(())
+    }
+
+    /// Stop the current speech synthesis
+    pub(super) fn macos_stop() -> crate::Result<()> {
+        unsafe {
+            let synth_mutex = get_synthesizer();
+            let synth = *synth_mutex.lock().unwrap();
+            let _: () = msg_send![synth, stopSpeakingAtBoundary: 0]; // 0 = immediate
         }
         Ok(())
     }
 }
 
 #[cfg(target_os = "macos")]
-use macos_impl::{macos_list_voices, macos_speak};
+use macos_impl::{macos_list_voices, macos_speak, macos_stop};
